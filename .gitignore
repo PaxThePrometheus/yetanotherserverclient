@@ -1,0 +1,31 @@
+# --- dependencies ---
+node_modules/
+
+# --- yasc runtime data (servers, downloads, logs) ---
+servers/
+cache/
+logs/
+*.log
+
+# --- local tooling / editor settings ---
+.claude/settings.local.json
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# --- OS cruft ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# --- misc ---
+*.tmp
+*.bak
+.env
+.env.*
