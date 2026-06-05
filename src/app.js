@@ -7,8 +7,8 @@ const { C } = require('./terminal');
 const { STATUS } = require('./server');
 const props = require('./properties');
 const stats = require('./stats');
-const { fmtRam } = require('./java');
-const { forgetServer } = require('./config');
+const { fmtRam, parseRam } = require('./java');
+const { forgetServer, rememberServer } = require('./config');
 const { download } = require('./providers');
 const { librariesFor } = require('./libraries');
 const network = require('./network');
@@ -279,10 +279,40 @@ class App {
     this.histIdx = -1;
     this.cScroll = 0;
     if (!line) return this.draw();
-    if (line === '.quit' || line === '.exit') return this.requestQuit();
     this.history.push(line);
     if (this.history.length > 200) this.history.shift();
+    if (line === '.quit' || line === '.exit') return this.requestQuit();
+    // Lines starting with '.' are yasc client commands, not server commands.
+    if (line[0] === '.') return this.clientCommand(line.slice(1));
     this.server.command(line);
+    this.draw();
+  }
+
+  // Panel-side commands (don't go to the server). Mainly: change RAM allocation.
+  clientCommand(cmd) {
+    const parts = cmd.split(/\s+/);
+    const name = (parts[0] || '').toLowerCase();
+    const arg = parts.slice(1).join(' ').trim();
+    const say = (t, lvl = 'sys') => this.server.pushLine('· ' + t, lvl);
+    switch (name) {
+      case 'ram': case 'mem': case 'memory': {
+        if (!arg) { say(`allocated RAM is ${fmtRam(this.record.ram || 0)}. Change it with “.ram 4G”.`); break; }
+        const mb = parseRam(arg, 0);
+        if (mb < 512) { say('RAM must be at least 512M, e.g. “.ram 2G” or “.ram 4096M”.', 'warn'); break; }
+        if (mb > 1024 * 64) { say('that is over 64G — refusing as a likely typo.', 'warn'); break; }
+        this.record.ram = mb;
+        this.server.record.ram = mb;
+        try { rememberServer(this.record); } catch {}
+        const running = this.server.status === STATUS.RUNNING || this.server.status === STATUS.STARTING;
+        say(`RAM set to ${fmtRam(mb)}${running ? ' — restart the server to apply (Ctrl+R).' : '.'}`);
+        break;
+      }
+      case 'help': case '?':
+        say('client commands: .ram <size> (e.g. .ram 4G) · .help · .quit  — anything else goes to the server.');
+        break;
+      default:
+        say(`unknown client command “.${name}”. Try .help (server commands don’t need a dot).`, 'warn');
+    }
     this.draw();
   }
 
@@ -487,17 +517,28 @@ class App {
     if (k.name === 'pageup') { o.focus = 'results'; o.sel = Math.max(0, o.sel - 8); return this.draw(); }
     if (k.name === 'pagedown') { o.focus = 'results'; o.sel = Math.min(o.results.length - 1, o.sel + 8); return this.draw(); }
     if (k.name === 'enter') {
+      clearTimeout(o._searchTimer);
       if (o.focus === 'results' && o.results[o.sel]) return this.installLibrary(o.results[o.sel]);
       return this.runLibrarySearch();
     }
-    if (k.name === 'backspace') { o.query = o.query.slice(0, -1); o.focus = 'query'; return this.draw(); }
-    if (k.name === 'C-u') { o.query = ''; o.focus = 'query'; return this.draw(); }
-    if (k.name === 'char') { o.query += k.ch; o.focus = 'query'; return this.draw(); }
+    // Typing searches live (debounced), so results update without pressing Enter.
+    if (k.name === 'backspace') { o.query = o.query.slice(0, -1); o.focus = 'query'; this.scheduleLibrarySearch(); return this.draw(); }
+    if (k.name === 'C-u') { o.query = ''; o.focus = 'query'; this.scheduleLibrarySearch(); return this.draw(); }
+    if (k.name === 'char') { o.query += k.ch; o.focus = 'query'; this.scheduleLibrarySearch(); return this.draw(); }
+  }
+
+  // Debounce keystrokes into a search so the results panel stays responsive.
+  scheduleLibrarySearch() {
+    const o = this.overlay;
+    if (!o || o.type !== 'library') return;
+    clearTimeout(o._searchTimer);
+    o._searchTimer = setTimeout(() => { if (this.overlay === o) this.runLibrarySearch(); }, 300);
   }
 
   runLibrarySearch() {
     const o = this.overlay;
     if (!o || o.type !== 'library') return;
+    clearTimeout(o._searchTimer);
     const lib = o.libs[o.libIdx];
     o.loading = true; o.error = ''; o.msg = '';
     this.draw();
@@ -505,8 +546,9 @@ class App {
       .then((res) => {
         if (this.overlay !== o) return;
         o.loading = false; o.results = res.hits; o.versionFiltered = res.versionFiltered;
-        o.sel = 0; o.scroll = 0; o.focus = res.hits.length ? 'results' : 'query';
-        if (!res.hits.length) o.msg = 'No results.';
+        o.sel = 0; o.scroll = 0;
+        // Keep focus in the search field while typing; only no-results forces it.
+        if (!res.hits.length) { o.focus = 'query'; o.msg = 'No results.'; }
         this.draw();
       })
       .catch((e) => {
@@ -1308,9 +1350,11 @@ class App {
       const maxLen = r.w - 6;
       let shown = this.cmd, off = 0;
       if (shown.length > maxLen) { off = shown.length - maxLen; shown = shown.slice(off); }
-      if (this.cmd) s.text(r.x + 4, r.y + 1, shown, C.white, maxLen);
-      else s.text(r.x + 4, r.y + 1, hot ? 'type a server command (e.g. say hi, op <name>, stop)…'
-        : 'server stopped — Ctrl+R to start, or go to the Server tab', C.faint, maxLen);
+      if (this.cmd) {
+        const style = this.cmd[0] === '.' ? C.purple : C.white;
+        s.text(r.x + 4, r.y + 1, shown, style, maxLen);
+      } else s.text(r.x + 4, r.y + 1, hot ? 'server command (say hi · op <name>) · .ram 4G to set memory · .help'
+        : 'server stopped — Ctrl+R to start · .ram <size> to set memory · Server tab', C.faint, maxLen);
       return { x: r.x + 4 + (this.cmd.length - off), y: r.y + 1 };
     }
     // contextual hint bar for non-console views
@@ -1400,7 +1444,7 @@ class App {
     const qActive = o.focus === 'query';
     s.text(x + 2, y + 2, 'Search', qActive ? C.borderHot + C.bold : C.muted);
     s.box(x + 2, y + 3, w - 4, 3, { style: qActive ? C.borderHot : C.border });
-    s.text(x + 4, y + 4, o.query || (qActive ? '' : 'type and press Enter…'), o.query ? C.white : C.faint, w - 8);
+    s.text(x + 4, y + 4, o.query || (qActive ? '' : 'type to search…'), o.query ? C.white : C.faint, w - 8);
 
     const listY = y + 7, listH = h - 9;
     if (o.loading) {
@@ -1429,7 +1473,7 @@ class App {
     let note;
     if (o.installing) note = this.spinner() + '  ' + o.msg;
     else if (o.msg) note = o.msg;
-    else note = 'type to search · Enter install · ↑↓ pick · Tab source · Esc close';
+    else note = 'type to search (live) · ↑↓ pick · Enter install · Tab source · Esc close';
     if (!o.versionFiltered && !o.loading && o.results.length && !o.msg) {
       note = '⚠ not version-filtered by this source · ' + note;
     }

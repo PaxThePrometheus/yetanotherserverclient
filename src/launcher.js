@@ -38,6 +38,8 @@ function launcher(screen, input, ctx = {}) {
       // import
       importStep: 'path',     // path | details
       pathStr: process.cwd(),
+      pathSug: [],            // spotlight folder suggestions
+      sugSel: -1,             // -1 = editing the field; >=0 = a suggestion
       jars: [],
       jarSel: 0,
       impName: '',
@@ -139,10 +141,31 @@ function launcher(screen, input, ctx = {}) {
       screen.text(x, y, 'Import an existing server', C.title + C.bold);
       let caret = null;
       if (state.importStep === 'path') {
-        const c = field(x, y + 2, w, 'Folder', state.pathStr, true,
-          'path to a folder containing a server .jar');
-        caret = c;
-        screen.text(x, y + 6, 'Enter to scan the folder for server jars.', C.faint);
+        const editing = state.sugSel < 0;
+        const c = field(x, y + 2, w, 'Folder', state.pathStr, editing,
+          'start typing a path — folders with a server jar are flagged');
+        if (editing) caret = c;
+        // spotlight suggestions
+        const listY = y + 6;
+        const rows = Math.max(3, bottom - listY - 2);
+        if (!state.pathSug.length) {
+          screen.text(x, listY, 'No matching folders here.', C.faint);
+        } else {
+          for (let i = 0; i < rows && i < state.pathSug.length; i++) {
+            const sug = state.pathSug[i];
+            const sel = i === state.sugSel;
+            const yy = listY + i;
+            if (sel) screen.fillRect(x, yy, w, 1, ' ', C.selBg);
+            const m = sug.mark; // 'server' | 'jar' | 'none'
+            const icon = m === 'server' ? '●' : m === 'jar' ? '◆' : '·';
+            const iconStyle = m === 'server' ? C.green : m === 'jar' ? C.cyan : C.faint;
+            const tag = m === 'server' ? 'server' : m === 'jar' ? 'has .jar' : '';
+            screen.text(x + 1, yy, icon, sel ? C.selFg : iconStyle);
+            screen.text(x + 3, yy, sug.name, sel ? C.selFg + C.bold : (m === 'none' ? C.muted : C.text), w - 14);
+            if (tag) screen.text(x + w - tag.length - 1, yy, tag, sel ? C.selFg : iconStyle);
+          }
+        }
+        screen.text(x, bottom - 1, '↑↓ pick · Tab open folder · Enter import · Esc back', C.faint, w);
       } else {
         screen.text(x, y + 2, 'Server jar', C.muted);
         const listH = Math.min(6, state.jars.length);
@@ -198,29 +221,35 @@ function launcher(screen, input, ctx = {}) {
       } else if (state.newStep === 'version') {
         const prov = PROVIDER_LIST[state.typeSel];
         const cache = state.verCache[prov.id] || { loading: true };
-        screen.text(x, cy, `${prov.name} version`
-          + (state.verFilter ? `   filter: ${state.verFilter}` : ''), C.muted);
+        // a visible search field (always — type to filter the version list live)
+        const sw = Math.min(40, w);
+        const sc = field(x, cy, sw, `Search ${prov.name} version`, state.verFilter, true,
+          'type to filter, e.g. 1.21  ·  blank = newest');
+        caret = sc;
+        const listY = cy + 4;
         if (cache.loading) {
-          screen.text(x + 1, cy + 2, '◠ fetching available versions…', C.gold);
+          screen.text(x + 1, listY, '◠ fetching available versions…', C.gold);
         } else if (cache.error) {
-          screen.text(x + 1, cy + 2, 'Could not fetch versions: ' + cache.error, C.red);
-          screen.text(x + 1, cy + 4, 'Type a version manually, then Enter: ' + state.verFilter, C.text);
-          caret = { x: x + 1 + 38 + state.verFilter.length, y: cy + 4 };
+          screen.text(x + 1, listY, 'Could not fetch versions: ' + cache.error, C.red, w - 2);
+          screen.text(x + 1, listY + 1, 'Type a version above and press Enter to use it anyway.', C.faint, w - 2);
         } else {
           const list = filteredVersions(cache.list);
-          const rows = Math.min(bottom - (cy + 1) - 3, 10);
+          const rows = Math.max(3, Math.min(bottom - listY - 2, 12));
           if (state.verSel >= list.length) state.verSel = Math.max(0, list.length - 1);
           if (state.verSel < state.verScroll) state.verScroll = state.verSel;
           if (state.verSel >= state.verScroll + rows) state.verScroll = state.verSel - rows + 1;
+          if (!list.length) {
+            screen.text(x + 1, listY, `No version matches “${state.verFilter}”.`, C.faint, w - 2);
+          }
           for (let i = 0; i < rows && i + state.verScroll < list.length; i++) {
             const idx = i + state.verScroll;
             const sel = idx === state.verSel;
-            if (sel) screen.fillRect(x, cy + 1 + i, 24, 1, ' ', C.selBg);
+            if (sel) screen.fillRect(x, listY + i, 28, 1, ' ', C.selBg);
             const latest = idx === 0 && !state.verFilter ? '  (latest)' : '';
-            screen.text(x + 1, cy + 1 + i, (sel ? '▸ ' : '  ') + list[idx] + latest,
-              sel ? C.selFg + C.bold : C.text, 24);
+            screen.text(x + 1, listY + i, (sel ? '▸ ' : '  ') + list[idx] + latest,
+              sel ? C.selFg + C.bold : C.text, 28);
           }
-          screen.text(x, bottom - 4, `${list.length} versions · type to filter`, C.faint);
+          screen.text(x, bottom - 1, `${list.length}/${cache.list.length} versions · ↑↓ select · Enter to choose`, C.faint, w);
         }
       } else if (state.newStep === 'details') {
         const nameC = field(x, cy, w, 'Server name', state.newName,
@@ -306,15 +335,28 @@ function launcher(screen, input, ctx = {}) {
         const it = items[state.homeSel];
         if (it.kind === 'server') return finish({ action: 'open', record: it.record });
         if (it.kind === 'new') { state.view = 'new'; state.newStep = 'type'; return draw(); }
-        if (it.kind === 'import') { state.view = 'import'; state.importStep = 'path'; return draw(); }
+        if (it.kind === 'import') { state.view = 'import'; state.importStep = 'path'; computeSuggestions(); return draw(); }
       }
     }
 
     function onImport(key) {
       if (key.name === 'escape') { state.view = 'home'; return draw(); }
       if (state.importStep === 'path') {
-        if (key.name === 'enter') return scanFolder();
-        return editText(state, 'pathStr', key) && draw();
+        const n = state.pathSug.length;
+        if (key.name === 'down') { if (n) state.sugSel = state.sugSel < 0 ? 0 : (state.sugSel + 1) % n; return draw(); }
+        if (key.name === 'up') { if (n) state.sugSel = state.sugSel <= 0 ? n - 1 : state.sugSel - 1; return draw(); }
+        if (key.name === 'tab' || key.name === 'right') {
+          const pick = state.sugSel >= 0 ? state.pathSug[state.sugSel] : state.pathSug[0];
+          if (pick) { state.pathStr = pick.full + path.sep; computeSuggestions(); }
+          return draw();
+        }
+        if (key.name === 'enter') {
+          if (state.sugSel >= 0 && state.pathSug[state.sugSel]) state.pathStr = state.pathSug[state.sugSel].full;
+          return scanFolder();
+        }
+        // typing edits the field and refreshes suggestions live
+        if (editText(state, 'pathStr', key)) { state.sugSel = -1; computeSuggestions(); return draw(); }
+        return;
       }
       // details step
       if (key.name === 'tab') {
@@ -327,6 +369,36 @@ function launcher(screen, input, ctx = {}) {
       if (key.name === 'enter') return doImport();
       const k = state.impField === 'name' ? 'impName' : 'impRam';
       return editText(state, k, key) && draw();
+    }
+
+    // Spotlight: list directories under the typed path and flag the ones that
+    // look like a Minecraft server (contain a .jar, ideally with server files).
+    function computeSuggestions() {
+      const raw = state.pathStr;
+      let base, partial;
+      const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+      if (raw && (isDir(raw) || /[\\/]$/.test(raw))) {
+        base = raw; partial = '';               // a complete folder → list its children
+      } else if (raw) {
+        base = path.dirname(raw); partial = path.basename(raw); // mid-typing → filter siblings
+      } else {
+        base = process.cwd(); partial = '';
+      }
+      let names = [];
+      try {
+        names = fs.readdirSync(base, { withFileTypes: true })
+          .filter((d) => { try { return d.isDirectory(); } catch { return false; } })
+          .map((d) => d.name);
+      } catch { names = []; }
+      const pl = partial.toLowerCase();
+      const cand = names.filter((n) => n.toLowerCase().startsWith(pl)).sort((a, b) => a.localeCompare(b)).slice(0, 24);
+      const sug = cand.map((name) => {
+        const full = path.join(base, name);
+        return { name, full, mark: folderMark(full) };
+      });
+      sug.sort((a, b) => (markRank(b.mark) - markRank(a.mark)) || a.name.localeCompare(b.name));
+      state.pathSug = sug.slice(0, 12);
+      if (state.sugSel >= state.pathSug.length) state.sugSel = -1;
     }
 
     function scanFolder() {
@@ -466,6 +538,18 @@ function editText(state, key, ev) {
 }
 
 // ---- misc helpers ----------------------------------------------------------
+// Classify a folder for the import spotlight: does it hold a server jar, and
+// does it look like an actual server (eula/properties/world/plugins/mods)?
+function folderMark(dir) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return 'none'; }
+  const hasJar = names.some((n) => /\.jar$/i.test(n));
+  const serverish = names.some((n) => /^(eula\.txt|server\.properties|server\.toml|config\.yml|bukkit\.yml|world|libraries|mods|plugins|versions)$/i.test(n));
+  if (hasJar) return serverish ? 'server' : 'jar';
+  return serverish ? 'server' : 'none';
+}
+function markRank(m) { return m === 'server' ? 2 : m === 'jar' ? 1 : 0; }
+
 function catTag(category) {
   return { vanilla: 'vanilla', servers: 'plugins', modded: 'modded', proxy: 'proxy' }[category] || category;
 }
@@ -514,4 +598,4 @@ function sanitize(name) {
   return String(name).trim().replace(/[^A-Za-z0-9._ -]/g, '').replace(/\s+/g, '-') || 'server';
 }
 
-module.exports = { launcher };
+module.exports = { launcher, folderMark, detectType };

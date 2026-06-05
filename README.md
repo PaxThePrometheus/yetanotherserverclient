@@ -132,7 +132,8 @@ You land on the home screen. Three things can happen there:
 2. **＋ Create a new server** —
    1. pick a **flavor** (`↑`/`↓` through Vanilla · Paper/Folia/Purpur ·
       Fabric/Forge/NeoForge · Velocity/Waterfall/BungeeCord);
-   2. pick a **version** (the list is fetched live; type to filter, newest first);
+   2. pick a **version** — there's a **search box**; just type to filter the
+      live list (e.g. `1.21`), newest first;
    3. name it and set its **memory** (e.g. `2G`);
    4. accept the **Minecraft EULA** (skipped for proxies, which don't need one).
 
@@ -140,9 +141,11 @@ You land on the home screen. Three things can happen there:
    Forge/NeoForge — writes `eula.txt`, lays down a sane default
    `server.properties` (game servers only), and drops you into the panel with
    the server starting.
-3. **⮈ Import an existing folder** — point it at any directory that already
-   contains a server jar (your current worlds, plugins and configs are left
-   exactly as they are). Pick the jar, give it a name and memory, and you're in.
+3. **⮈ Import an existing folder** — the folder field works like **Spotlight**:
+   as you type a path it lists the sub-folders and **flags the ones that look
+   like a server** (`●` already a server, `◆` has a `.jar`). `↑`/`↓` to pick,
+   `Tab` to open a folder, `Enter` to import. Your worlds, plugins and configs
+   are left exactly as they are.
 
 Servers you create live under **`servers/<name>` next to the project** (so the
 whole thing is portable and easy to find); imported servers stay wherever they
@@ -158,7 +161,7 @@ restarting yasc.
 | 2 | **Players** | see who's online; `Enter` opens op/kick/ban/whitelist actions |
 | 3 | **Properties** | `↑`/`↓` a key, `Enter` to edit its value — saved to `server.properties` |
 | 4 | **Files** | browse the folder, open a text config, `Enter` a line to edit it, `Ctrl+S` to save |
-| 5 | **Plugins** | toggle plugin/mod jars, or `Enter` the top row to **search & install** from Modrinth / Hangar / SpigotMC (`Tab` switches source) |
+| 5 | **Plugins** | toggle plugin/mod jars, or `Enter` the top row to **search (live, as you type) & install** from Modrinth / Hangar / SpigotMC (`Tab` switches source) |
 | 6 | **Network** | LAN/public IP + join address; test reachability, UPnP-forward, or start a tunnel |
 | 7 | **Server** | Start / Stop / Restart / Force-kill, accept EULA, **back to server list**, view jar/Java/RAM/port |
 
@@ -200,6 +203,17 @@ terminal.
 mouse wheel or `PgUp`/`PgDn` scroll · `Esc` clear the line.
 **List views:** `↑`/`↓` (or wheel) to move, `Enter` to act, `Esc` to back out.
 **Editors (properties / files):** `Enter` edit · `Ctrl+S` save · `Esc` cancel.
+
+### Console commands
+
+Anything you type goes to the server, **except** lines starting with `.`, which
+are yasc's own commands:
+
+| Command | Action |
+|---------|--------|
+| `.ram <size>` | set the server's allocated memory, e.g. `.ram 4G` or `.ram 4096M` (applies on the next restart) |
+| `.help` | list these commands |
+| `.quit` | close the panel |
 
 ## Where things live
 

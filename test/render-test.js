@@ -173,16 +173,30 @@ for (const [w, h] of sizes) {
   });
 }
 
-// Launcher home/footer tooltips must not leak literal color codes either.
-tryDraw('launcher-home tooltip', () => {
-  const { launcher } = require('../src/launcher');
-  const sc = makeScreen(100, 30);
-  const input = new (require('events').EventEmitter)();
-  input.stop = () => {};
-  launcher(sc, input, { cfg: { servers: [{ name: 'S', dir: 'x', jar: 'j', type: 'paper', version: '1.21.8', ram: 2048 }] }, java: { ok: true } });
-  assertNoLiteralSGR(sc, 'launcher-home'); // first draw is synchronous
-  input.emit('key', { name: 'C-c' });      // resolve + detach the wizard
-});
+// Launcher views (home, import-spotlight, create/version-search) must render
+// without crashing and without leaking literal color codes.
+function driveLauncher(label, keys) {
+  tryDraw(label, () => {
+    const { launcher } = require('../src/launcher');
+    const sc = makeScreen(100, 30);
+    const input = new (require('events').EventEmitter)();
+    input.stop = () => {};
+    launcher(sc, input, { cfg: { servers: [{ name: 'S', dir: 'x', jar: 'j', type: 'paper', version: '1.21.8', ram: 2048 }] }, java: { ok: true } });
+    for (const k of keys) input.emit('key', k);
+    assertNoLiteralSGR(sc, label);
+    input.emit('key', { name: 'C-c' }); // resolve + detach the wizard
+  });
+}
+driveLauncher('launcher-home tooltip', []);
+driveLauncher('launcher-import spotlight', [
+  { name: 'down' }, { name: 'enter' },                 // -> import view (computes suggestions)
+  { name: 'down' }, { name: 'char', ch: 's' },         // navigate + type a path char
+]);
+driveLauncher('launcher-version search', [
+  { name: 'down' }, { name: 'enter' },                 // create new -> flavor list
+  { name: 'down' }, { name: 'enter' },                 // pick a flavor -> version search box
+  { name: 'char', ch: '1' }, { name: 'char', ch: '.' },// type a version filter
+]);
 
 function assertCleanBuffer(a, label) {
   for (let i = 0; i < a.screen.buf.length; i++) {
