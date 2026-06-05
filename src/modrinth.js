@@ -16,13 +16,19 @@ const { fetchJson } = require('./providers');
 //   loaders — loader categories the server can load, in preference order
 function compatFor(flavor) {
   switch (flavor) {
-    case 'paper': return { type: 'plugin', loaders: ['paper', 'spigot', 'bukkit'] };
+    case 'paper':
+    case 'folia': return { type: 'plugin', loaders: ['paper', 'spigot', 'bukkit', 'folia'] };
     case 'purpur': return { type: 'plugin', loaders: ['purpur', 'paper', 'spigot', 'bukkit'] };
     case 'spigot': return { type: 'plugin', loaders: ['spigot', 'bukkit'] };
     case 'craftbukkit': return { type: 'plugin', loaders: ['bukkit'] };
+    case 'velocity': return { type: 'plugin', loaders: ['velocity'] };
+    case 'waterfall':
+    case 'bungeecord': return { type: 'plugin', loaders: ['waterfall', 'bungeecord'] };
     case 'fabric': return { type: 'mod', loaders: ['fabric'] };
     case 'quilt': return { type: 'mod', loaders: ['quilt', 'fabric'] };
-    default: return null; // vanilla / forge-via-arclight etc. — no Modrinth install
+    case 'forge': return { type: 'mod', loaders: ['forge'] };
+    case 'neoforge': return { type: 'mod', loaders: ['neoforge'] };
+    default: return null; // vanilla — no Modrinth install
   }
 }
 

@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
 const { spawn } = require('child_process');
-const { buildArgs } = require('./java');
 const log = require('./logger');
 
 /*
@@ -38,8 +37,24 @@ const MC_ANSI = {
   'l': '\x1b[1m', 'o': '\x1b[3m', 'n': '\x1b[4m', 'm': '\x1b[9m', 'r': '\x1b[0m',
 };
 function mcToAnsi(s) {
-  return String(s).replace(/[§§&]([0-9a-fk-or])/gi, (_, c) =>
+  return String(s).replace(/§([0-9a-fk-or])/gi, (_, c) =>
     MC_ANSI[c.toLowerCase()] || '');
+}
+
+// Server consoles (esp. Paper via JLine) emit carriage returns, cursor-move
+// escapes, tabs and the occasional bare ESC. Left in, those bytes corrupt the
+// TUI when rendered. Keep only SGR color codes (\x1b[…m); strip the rest.
+function sanitizeConsole(s) {
+  return String(s)
+    // OSC sequences: \x1b]…BEL or \x1b]…ST
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
+    // CSI sequences: keep SGR (ends in 'm'), drop all others (cursor moves, etc.)
+    .replace(/\x1b\[[0-9;?<>=!]*([@-~])/g, (seq, fin) => (fin === 'm' ? seq : ''))
+    // strip bare/leftover ESC, but never an ESC that begins a kept SGR code
+    .replace(/\x1b(?!\[[0-9;?<>=!]*m)/g, '')
+    // tabs → spaces, then drop remaining control characters (ESC 0x1b excepted)
+    .replace(/\t/g, '  ')
+    .replace(/[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]/g, '');
 }
 
 class MinecraftServer extends EventEmitter {
@@ -57,24 +72,74 @@ class MinecraftServer extends EventEmitter {
     this._partial = '';               // incomplete stdout line
     this._stopTimer = null;
     this._exitWanted = false;
+
+    // Flavor traits (set by the launcher/index; sensible defaults for imports).
+    this.category = record.category || 'servers';
+    this.kind = record.kind || 'plugins';     // plugins | mods | none
+    this.usesEula = record.eula !== false && record.category !== 'proxy';
+    this.usesNogui = record.nogui !== false && record.category !== 'proxy';
+
+    // Live telemetry, refreshed by an unobtrusive (suppressed) poller.
+    this.metrics = { tps: null, tps5: null, tps15: null, mspt: null, worldMB: null, content: null };
+    this.tpsSupported = this.category !== 'proxy' && this.type() !== 'vanilla';
+    this._metricSentAt = 0;
+    this._metricKind = null;
+    this._mFlip = false;
+    this._metricTimer = null;
+    this._diskTimer = null;
+  }
+
+  type() { return this.record.type; }
+  isPaperFamily() { return ['paper', 'folia', 'purpur'].includes(this.record.type); }
+
+  // Work out how to launch this flavor: a runnable jar, a Forge/NeoForge
+  // @args file produced by its installer, with or without `nogui`.
+  resolveLaunch() {
+    const ram = this.record.ram || 2048;
+    const xmx = `-Xmx${ram}M`, xms = `-Xms${Math.max(512, Math.floor(ram / 2))}M`;
+    const enc = '-Dfile.encoding=UTF-8';
+    const nogui = this.usesNogui ? ['nogui'] : [];
+    if (this.record.launch && this.record.launch.loaderName) {
+      const af = this.findForgeArgfile();
+      if (af) return { args: [xmx, xms, enc, '@' + af, ...nogui] };
+      // else fall through and try a runnable jar (legacy Forge ships one)
+    }
+    const jar = this.record.jar;
+    if (!jar || !fs.existsSync(path.join(this.dir, jar))) {
+      return { error: `launch jar not found: ${jar || '(none)'} in ${this.dir}` };
+    }
+    return { args: [xms, xmx, enc, '-jar', jar, ...nogui] };
+  }
+
+  findForgeArgfile() {
+    const L = this.record.launch || {};
+    const plat = process.platform === 'win32' ? 'win_args.txt' : 'unix_args.txt';
+    const candidates = [];
+    if (L.loaderName === 'neoforge' && L.loader)
+      candidates.push(path.join('libraries', 'net', 'neoforged', 'neoforge', L.loader, plat));
+    if (L.loaderName === 'forge' && L.mc && L.loader)
+      candidates.push(path.join('libraries', 'net', 'minecraftforge', 'forge', `${L.mc}-${L.loader}`, plat));
+    for (const c of candidates) if (fs.existsSync(path.join(this.dir, c))) return c;
+    try {
+      const found = scanFor(path.join(this.dir, 'libraries'), plat, 6);
+      if (found) return path.relative(this.dir, found);
+    } catch {}
+    return null;
   }
 
   // ---- lifecycle ---------------------------------------------------------
 
   start() {
     if (this.child) return;
-    const jarPath = path.join(this.dir, this.record.jar);
-    if (!fs.existsSync(jarPath)) {
-      this.pushLine(`! jar not found: ${this.record.jar}`, 'error');
-      return;
-    }
-    if (!this.eulaAccepted()) {
+    const launch = this.resolveLaunch();
+    if (launch.error) { this.pushLine('! ' + launch.error, 'error'); return; }
+    if (this.usesEula && !this.eulaAccepted()) {
       this.emit('eula');
       this.pushLine('! Mojang EULA not accepted — start blocked.', 'warn');
       return;
     }
 
-    const args = buildArgs({ jar: this.record.jar, ramMB: this.record.ram });
+    const args = launch.args;
     const bin = this.record.java || 'java';
     log.event('server start', { dir: this.dir, bin, args });
     this.setStatus(STATUS.STARTING);
@@ -104,10 +169,11 @@ class MinecraftServer extends EventEmitter {
     child.on('exit', (code, signal) => this.onExit(code, signal));
   }
 
-  // Graceful stop: ask the server to `stop`, then force-kill if it hangs.
+  // Graceful stop: ask the server to shut down, then force-kill if it hangs.
   stop({ force = false } = {}) {
     if (!this.child) return;
     this._exitWanted = true;
+    this.stopMetrics();
     if (force) {
       this.pushLine('· force killing server…', 'sys');
       try { this.child.kill('SIGKILL'); } catch {}
@@ -115,7 +181,12 @@ class MinecraftServer extends EventEmitter {
     }
     this.setStatus(STATUS.STOPPING);
     this.pushLine('· stopping server…', 'sys');
-    this.sendRaw('stop');
+    // Game servers use `stop`; BungeeCord/Waterfall use `end`; Velocity has no
+    // stdin stop, so we signal it.
+    const cmd = this.category === 'proxy'
+      ? (this.record.type === 'velocity' ? null : 'end')
+      : 'stop';
+    if (cmd) this.sendRaw(cmd); else { try { this.child.kill(); } catch {} }
     clearTimeout(this._stopTimer);
     this._stopTimer = setTimeout(() => {
       if (this.child) {
@@ -133,6 +204,9 @@ class MinecraftServer extends EventEmitter {
 
   onExit(code, signal) {
     clearTimeout(this._stopTimer);
+    this.stopMetrics();
+    this.stopDiskSampling();
+    this.metrics.tps = this.metrics.tps5 = this.metrics.tps15 = this.metrics.mspt = null;
     const wasRunning = this.status === STATUS.RUNNING || this.status === STATUS.STARTING;
     this.child = null;
     this.players.clear();
@@ -173,8 +247,9 @@ class MinecraftServer extends EventEmitter {
   }
 
   ingest(line) {
+    if (this.consumeMetric(line)) return; // suppress our own /tps /mspt polls
     const level = classify(line);
-    this.pushLine(mcToAnsi(line), level);
+    this.pushLine(sanitizeConsole(mcToAnsi(line)), level);
     this.parse(line);
   }
 
@@ -210,9 +285,13 @@ class MinecraftServer extends EventEmitter {
     const msg = line.replace(/^\[[^\]]*\]\s*\[[^\]]*\]:?\s*/, '')
       .replace(/^\[[^\]]*\]:?\s*/, '');
 
-    if (this.status === STATUS.STARTING && /\bDone\b\s*\([\d.]+s\)!/.test(line)) {
+    // Game servers print "Done (Xs)!"; BungeeCord/Waterfall print "Listening on".
+    if (this.status === STATUS.STARTING &&
+        (/\bDone\b\s*\([\d.]+s\)!/.test(line) || /Listening on /i.test(line))) {
       this.setStatus(STATUS.RUNNING);
-      this.sendRaw('list'); // seed the roster
+      if (this.category !== 'proxy') this.sendRaw('list'); // seed the roster
+      this.startMetrics();
+      this.startDiskSampling();
       return;
     }
     let m;
@@ -236,6 +315,80 @@ class MinecraftServer extends EventEmitter {
       this.emit('players');
       return;
     }
+  }
+
+  // ---- telemetry ---------------------------------------------------------
+
+  // Poll TPS (and MSPT on Paper-family) by quietly issuing the command and
+  // swallowing its echo + reply, so the figures update without spamming console.
+  startMetrics() {
+    this.stopMetrics();
+    if (!this.tpsSupported) return;
+    this._metricTimer = setInterval(() => this.pollMetric(), 6000);
+    setTimeout(() => this.pollMetric(), 1500);
+  }
+  stopMetrics() { if (this._metricTimer) { clearInterval(this._metricTimer); this._metricTimer = null; } }
+
+  pollMetric() {
+    if (this.status !== STATUS.RUNNING || !this.child) return;
+    this._mFlip = !this._mFlip;
+    const cmd = (this.isPaperFamily() && this._mFlip) ? 'mspt'
+      : (this.record.type === 'forge' || this.record.type === 'neoforge') ? 'forge tps' : 'tps';
+    this._metricKind = cmd.includes('mspt') ? 'mspt' : 'tps';
+    this._metricSentAt = Date.now();
+    this.sendRaw(cmd);
+  }
+
+  // Returns true if the line was a reply to our metric poll (and is suppressed).
+  consumeMetric(line) {
+    if (!this._metricSentAt || Date.now() - this._metricSentAt > 2500) return false;
+    const t = decolor(line);
+    let m;
+    if ((m = t.match(/TPS from last[^:]*:\s*\*?\s*([\d.]+),\s*\*?\s*([\d.]+),\s*\*?\s*([\d.]+)/i))) {
+      this.metrics.tps = +m[1]; this.metrics.tps5 = +m[2]; this.metrics.tps15 = +m[3];
+      this.emit('metrics'); return true;
+    }
+    if ((m = t.match(/Mean TPS:\s*([\d.]+)/i))) { this.metrics.tps = +m[1]; this.emit('metrics'); return true; }
+    if (/Mean tick time:\s*([\d.]+)/i.test(t)) {
+      this.metrics.mspt = +RegExp.$1; this.emit('metrics'); return true;
+    }
+    if (/tick times|Server tick/i.test(t)) return true; // mspt header line
+    if (this._metricKind === 'mspt' && (m = t.match(/([\d.]+)\s*\/\s*[\d.]+\s*\/\s*[\d.]+/))) {
+      this.metrics.mspt = +m[1]; this.emit('metrics'); return true;
+    }
+    if (/Unknown(\s+or\s+incomplete)?\s+command/i.test(t)) {
+      // This flavor has no such command — stop polling so we don't loop.
+      this.tpsSupported = false; this.stopMetrics(); return true;
+    }
+    return false;
+  }
+
+  // World size on disk (best-effort, infrequent) + content (plugin/mod) count.
+  startDiskSampling() {
+    this.stopDiskSampling();
+    const tick = () => { this.sampleDisk(); };
+    this._diskTimer = setInterval(tick, 60000);
+    setTimeout(tick, 2000);
+  }
+  stopDiskSampling() { if (this._diskTimer) { clearInterval(this._diskTimer); this._diskTimer = null; } }
+
+  sampleDisk() {
+    try {
+      let bytes = 0;
+      for (const name of fs.readdirSync(this.dir)) {
+        const p = path.join(this.dir, name);
+        let st; try { st = fs.statSync(p); } catch { continue; }
+        if (st.isDirectory() && /^world|^DIM|world$/i.test(name) || (st.isDirectory() && fs.existsSync(path.join(p, 'level.dat')))) {
+          bytes += dirSize(p, 25000);
+        }
+      }
+      this.metrics.worldMB = bytes / 1048576;
+    } catch {}
+    try {
+      const cdir = path.join(this.dir, this.kind === 'mods' ? 'mods' : 'plugins');
+      this.metrics.content = fs.readdirSync(cdir).filter((f) => /\.jar$/i.test(f)).length;
+    } catch { this.metrics.content = null; }
+    this.emit('metrics');
   }
 
   // ---- helpers -----------------------------------------------------------
@@ -285,4 +438,42 @@ function classify(line) {
   return 'info';
 }
 
-module.exports = { MinecraftServer, STATUS, mcToAnsi };
+// Strip ANSI + Minecraft section codes for plain-text matching.
+function decolor(s) {
+  return String(s).replace(/\x1b\[[0-9;]*m/g, '').replace(/[§&][0-9a-fk-or]/gi, '');
+}
+
+// Find a file by name under dir, up to `depth` levels deep (for Forge args).
+function scanFor(dir, name, depth) {
+  if (depth < 0) return null;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isFile() && e.name === name) return p;
+    if (e.isDirectory()) { const r = scanFor(p, name, depth - 1); if (r) return r; }
+  }
+  return null;
+}
+
+// Recursive directory size in bytes, capped at `budget` entries so a giant
+// world can't stall the sampler.
+function dirSize(dir, budget) {
+  let total = 0;
+  const stack = [dir];
+  let seen = 0;
+  while (stack.length && seen < budget) {
+    const d = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (seen++ >= budget) break;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else { try { total += fs.statSync(p).size; } catch {} }
+    }
+  }
+  return total;
+}
+
+module.exports = { MinecraftServer, STATUS, mcToAnsi, decolor };

@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { C } = require('./terminal');
-const { PROVIDER_LIST } = require('./providers');
+const { PROVIDER_LIST, metaFor } = require('./providers');
 const { SERVERS_DIR } = require('./config');
 const { fmtRam, parseRam } = require('./java');
 
@@ -46,6 +46,7 @@ function launcher(screen, input, ctx = {}) {
       // new
       newStep: 'type',        // type | version | details | eula
       typeSel: 0,
+      typeScroll: 0,
       verCache: {},           // providerId -> { loading, list, error }
       verSel: 0,
       verScroll: 0,
@@ -92,10 +93,9 @@ function launcher(screen, input, ctx = {}) {
       else if (state.view === 'new') caret = drawNew(bodyX, bodyY, bodyW, py + ph);
 
       const footerY = py + ph - 2;
-      const msg = state.error ? (C.red + state.error)
-        : state.info ? (C.cyan + state.info)
-          : C.faint + footerHint();
-      screen.text(px + 2, footerY, ' ' + msg + ' ', '');
+      const msg = state.error || state.info || footerHint();
+      const msgStyle = state.error ? C.red : state.info ? C.cyan : C.faint;
+      screen.text(px + 2, footerY, ' ' + msg + ' ', msgStyle);
 
       if (caret) { screen.showCursor(); screen.render(); screen.placeCursor(caret.x, caret.y); }
       else { screen.hideCursor(); screen.render(); }
@@ -180,13 +180,21 @@ function launcher(screen, input, ctx = {}) {
       const cy = y + 3;
       if (state.newStep === 'type') {
         screen.text(x, cy, 'Server flavor', C.muted);
-        PROVIDER_LIST.forEach((p, i) => {
-          const sel = i === state.typeSel;
-          if (sel) screen.fillRect(x, cy + 1 + i, w, 1, ' ', C.selBg);
-          screen.text(x + 1, cy + 1 + i, (sel ? '▸ ' : '  ') + p.name,
-            sel ? C.selFg + C.bold : C.text);
-          screen.text(x + 14, cy + 1 + i, providerBlurb(p.id), sel ? C.selFg : C.faint);
-        });
+        const rows = Math.max(4, bottom - (cy + 1) - 2);
+        if (state.typeSel < state.typeScroll) state.typeScroll = state.typeSel;
+        if (state.typeSel >= state.typeScroll + rows) state.typeScroll = state.typeSel - rows + 1;
+        for (let i = 0; i < rows && i + state.typeScroll < PROVIDER_LIST.length; i++) {
+          const idx = i + state.typeScroll;
+          const p = PROVIDER_LIST[idx];
+          const sel = idx === state.typeSel;
+          const yy = cy + 1 + i;
+          if (sel) screen.fillRect(x, yy, w, 1, ' ', C.selBg);
+          screen.text(x + 1, yy, (sel ? '▸ ' : '  ') + p.name, sel ? C.selFg + C.bold : C.text, 11);
+          screen.text(x + 13, yy, p.blurb || '', sel ? C.selFg : C.faint, w - 26);
+          const tag = catTag(p.category);
+          screen.text(x + w - tag.length - 1, yy, tag, sel ? C.selFg : C.faint);
+        }
+        screen.text(x, bottom - 2, `${PROVIDER_LIST.length} flavors · ↑↓ select · ${PROVIDER_LIST[state.typeSel].name}`, C.faint, w);
       } else if (state.newStep === 'version') {
         const prov = PROVIDER_LIST[state.typeSel];
         const cache = state.verCache[prov.id] || { loading: true };
@@ -226,13 +234,19 @@ function launcher(screen, input, ctx = {}) {
         const prov = PROVIDER_LIST[state.typeSel];
         screen.text(x, cy, 'Review', C.muted);
         screen.text(x + 1, cy + 1, `${prov.name} ${chosenVersion()}  ·  ${state.newName}  ·  ${fmtRam(parseRam(state.newRam))}`, C.text);
-        screen.text(x, cy + 3, 'Minecraft EULA', C.muted);
-        screen.text(x + 1, cy + 4, 'You must accept the Mojang EULA to run a server:', C.text);
-        screen.text(x + 1, cy + 5, 'https://aka.ms/MinecraftEULA', C.cyan);
-        const on = state.eulaAccept;
-        screen.text(x + 1, cy + 7, `[${on ? '✓' : ' '}] I accept the Minecraft EULA`,
-          on ? C.green + C.bold : C.gold);
-        screen.text(x + 1, cy + 9, 'Space/←→ toggle · Enter to create & download.', C.faint);
+        if (prov.install) screen.text(x + 1, cy + 2, '⚠ uses an installer — first launch sets up after download', C.gold, w - 2);
+        if (prov.eula === false) {
+          screen.text(x, cy + 4, 'Ready', C.muted);
+          screen.text(x + 1, cy + 5, 'This flavor needs no Minecraft EULA.', C.text);
+          screen.text(x + 1, cy + 7, 'Enter to create & download.', C.faint);
+        } else {
+          screen.text(x, cy + 4, 'Minecraft EULA', C.muted);
+          screen.text(x + 1, cy + 5, 'You must accept the Mojang EULA to run a server:', C.text);
+          screen.text(x + 1, cy + 6, 'https://aka.ms/MinecraftEULA', C.cyan);
+          const on = state.eulaAccept;
+          screen.text(x + 1, cy + 8, `[${on ? '✓' : ' '}] I accept the Minecraft EULA`, on ? C.green + C.bold : C.gold);
+          screen.text(x + 1, cy + 9, 'Space/←→ toggle · Enter to create & download.', C.faint);
+        }
       }
       return caret;
     }
@@ -339,10 +353,12 @@ function launcher(screen, input, ctx = {}) {
       const dir = path.resolve(state.pathStr.trim());
       const jar = state.jars[state.jarSel];
       const name = state.impName.trim() || path.basename(dir);
+      const type = detectType(jar);
+      const meta = metaFor(type);
       const record = {
-        name, dir, jar,
-        type: detectType(jar), version: detectVersion(dir, jar),
+        name, dir, jar, type, version: detectVersion(dir, jar),
         ram: parseRam(state.impRam),
+        category: meta.category, kind: meta.kind, eula: meta.eula, nogui: meta.nogui,
       };
       finish({ action: 'import', record });
     }
@@ -408,20 +424,22 @@ function launcher(screen, input, ctx = {}) {
     }
 
     function onNewEula(key) {
-      if (key.name === 'char' && key.ch === ' ' || key.name === 'left' || key.name === 'right') {
+      const prov = PROVIDER_LIST[state.typeSel];
+      const needsEula = prov.eula !== false;
+      if (needsEula && (key.name === 'char' && key.ch === ' ' || key.name === 'left' || key.name === 'right')) {
         state.eulaAccept = !state.eulaAccept;
         return draw();
       }
       if (key.name === 'enter') {
-        if (!state.eulaAccept) { state.error = 'You must accept the EULA to create a server.'; return draw(); }
-        const prov = PROVIDER_LIST[state.typeSel];
+        if (needsEula && !state.eulaAccept) { state.error = 'You must accept the EULA to create a server.'; return draw(); }
         const version = chosenVersion();
         const name = state.newName.trim();
         const plan = {
           provider: prov.id, type: prov.id, version, name,
           dir: path.join(SERVERS_DIR, sanitize(name)),
           ram: parseRam(state.newRam),
-          eula: true,
+          category: prov.category, kind: prov.kind,
+          eula: needsEula, nogui: prov.nogui !== false, install: !!prov.install,
         };
         finish({ action: 'new', plan });
       }
@@ -448,27 +466,29 @@ function editText(state, key, ev) {
 }
 
 // ---- misc helpers ----------------------------------------------------------
-function providerBlurb(id) {
-  return {
-    vanilla: 'official Mojang server',
-    paper: 'fast, plugin-ready (Bukkit/Spigot)',
-    purpur: 'Paper fork, extra config',
-    fabric: 'lightweight mod loader',
-  }[id] || '';
+function catTag(category) {
+  return { vanilla: 'vanilla', servers: 'plugins', modded: 'modded', proxy: 'proxy' }[category] || category;
 }
 
 function score(jar) {
   const j = jar.toLowerCase();
-  if (/paper|purpur|spigot|fabric-server|server\.jar|minecraft_server/.test(j)) return 2;
+  if (/paper|purpur|folia|spigot|fabric|forge|neoforge|velocity|waterfall|bungee|server\.jar|minecraft_server/.test(j)) return 2;
   if (/server/.test(j)) return 1;
   return 0;
 }
 
 function detectType(jar) {
   const j = (jar || '').toLowerCase();
+  if (j.includes('folia')) return 'folia';
   if (j.includes('paper')) return 'paper';
   if (j.includes('purpur')) return 'purpur';
+  if (j.includes('neoforge')) return 'neoforge';
+  if (j.includes('forge')) return 'forge';
   if (j.includes('fabric')) return 'fabric';
+  if (j.includes('quilt')) return 'quilt';
+  if (j.includes('velocity')) return 'velocity';
+  if (j.includes('waterfall')) return 'waterfall';
+  if (j.includes('bungee')) return 'bungeecord';
   if (j.includes('spigot')) return 'spigot';
   if (j.includes('bukkit')) return 'craftbukkit';
   return 'vanilla';

@@ -1,6 +1,6 @@
 {
   "name": "yasc",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Yet Another Server Client — a lightweight terminal-only Minecraft Java server control panel with a polished TUI.",
   "type": "commonjs",
   "bin": {

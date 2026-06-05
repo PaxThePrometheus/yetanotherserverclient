@@ -4,6 +4,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { Screen, Input, C } = require('./terminal');
 const { launcher } = require('./launcher');
 const { App } = require('./app');
@@ -109,7 +110,8 @@ function shutdown(restore) {
 }
 
 // Create a brand-new server: make the dir, download the chosen jar with a
-// progress bar, accept the EULA, and lay down a default server.properties.
+// progress bar, run an installer if the flavor needs one, accept the EULA, and
+// lay down a default server.properties.
 async function createServer(plan, screen, input, java) {
   fs.mkdirSync(plan.dir, { recursive: true });
   fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -118,26 +120,78 @@ async function createServer(plan, screen, input, java) {
   if (!provider) throw new Error('unknown server flavor: ' + plan.provider);
 
   drawProgress(screen, plan, 'Resolving download…', 0, 0);
-  const { url, filename } = await provider.resolve(plan.version);
-  log.event('download', { url, filename });
+  const resolved = await provider.resolve(plan.version);
+  log.event('download', { url: resolved.url, filename: resolved.filename, installer: !!resolved.installer });
 
-  const dest = path.join(plan.dir, filename);
-  await download(url, dest, (got, total) => drawProgress(screen, plan, 'Downloading ' + filename, got, total));
+  const dest = path.join(plan.dir, resolved.filename);
+  await download(resolved.url, dest, (got, total) => drawProgress(screen, plan, 'Downloading ' + resolved.filename, got, total));
+
+  let jar = resolved.filename;
+  let launch;
+  if (resolved.installer) {
+    // Forge/NeoForge: run their installer, then find how to launch the result.
+    drawProgress(screen, plan, `Installing ${cap(plan.provider)} — this can take a minute…`, 0, 0);
+    const bin = java.ok ? java.bin : 'java';
+    const res = spawnSync(bin, ['-jar', resolved.filename, '--installServer'],
+      { cwd: plan.dir, encoding: 'utf8', timeout: 8 * 60 * 1000, windowsHide: true });
+    log.event('installer done', { code: res.status, stderr: (res.stderr || '').slice(0, 400) });
+    if (res.status !== 0) {
+      throw new Error(`${cap(plan.provider)} installer failed (code ${res.status}). `
+        + ((res.stderr || res.stdout || 'no output').trim().slice(0, 200)));
+    }
+    const det = detectInstalledLaunch(plan, resolved);
+    launch = det.launch; jar = det.jar || resolved.filename;
+  }
   drawProgress(screen, plan, 'Finishing up…', 1, 1);
 
-  // EULA + default properties so the very first start actually runs.
+  // EULA + default properties so the very first start actually runs (game
+  // servers only — proxies use their own auto-generated config).
   if (plan.eula) fs.writeFileSync(path.join(plan.dir, 'eula.txt'),
     '#Accepted via yasc — https://aka.ms/MinecraftEULA\neula=true\n');
-  const propPath = path.join(plan.dir, 'server.properties');
-  if (!fs.existsSync(propPath)) {
-    fs.writeFileSync(propPath, props.defaults({ motd: plan.name }));
+  if (plan.category !== 'proxy') {
+    const propPath = path.join(plan.dir, 'server.properties');
+    if (!fs.existsSync(propPath)) fs.writeFileSync(propPath, props.defaults({ motd: plan.name }));
   }
 
   return {
-    name: plan.name, dir: plan.dir, jar: filename,
+    name: plan.name, dir: plan.dir, jar,
     type: plan.type, version: plan.version, ram: plan.ram,
+    category: plan.category, kind: plan.kind, eula: plan.eula, nogui: plan.nogui,
+    launch,
     java: java.ok ? java.bin : 'java',
   };
+}
+
+// After a Forge/NeoForge install, decide how to launch: a modern @args file
+// (preferred) or a legacy runnable universal/server jar.
+function detectInstalledLaunch(plan, resolved) {
+  const dir = plan.dir;
+  const plat = process.platform === 'win32' ? 'win_args.txt' : 'unix_args.txt';
+  const argRoot = plan.provider === 'neoforge'
+    ? path.join(dir, 'libraries', 'net', 'neoforged', 'neoforge')
+    : path.join(dir, 'libraries', 'net', 'minecraftforge', 'forge');
+  if (findFirst(argRoot, plat, 4)) {
+    return { launch: { loaderName: plan.provider, mc: resolved.mc, loader: resolved.loader }, jar: '' };
+  }
+  // Legacy: a runnable jar dropped in the server dir.
+  let jars = [];
+  try { jars = fs.readdirSync(dir).filter((f) => /\.jar$/i.test(f) && !/installer/i.test(f)); } catch {}
+  const jar = jars.find((f) => /forge-.*(universal|server)/i.test(f))
+    || jars.find((f) => /minecraft_server|^server\.jar$/i.test(f))
+    || jars.find((f) => /forge/i.test(f)) || '';
+  return { launch: null, jar };
+}
+
+function findFirst(dir, name, depth) {
+  if (depth < 0) return null;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isFile() && e.name === name) return p;
+    if (e.isDirectory()) { const r = findFirst(p, name, depth - 1); if (r) return r; }
+  }
+  return null;
 }
 
 // A centered progress box drawn straight to the screen buffer.

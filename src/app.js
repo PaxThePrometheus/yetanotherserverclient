@@ -10,7 +10,7 @@ const stats = require('./stats');
 const { fmtRam } = require('./java');
 const { forgetServer } = require('./config');
 const { download } = require('./providers');
-const modrinth = require('./modrinth');
+const { librariesFor } = require('./libraries');
 const network = require('./network');
 const upnp = require('./upnp');
 const tunnels = require('./tunnels');
@@ -93,15 +93,20 @@ class App {
       this._resolve = resolve;
 
       this._keyHandler = (k) => this.onKey(k);
+      this._mouseHandler = (m) => this.onMouse(m);
       this._redraw = () => this.draw();
+      this._onLine = () => this.onConsoleLine();
       this._onExit = () => this.onServerExit();
       this._onEula = () => { if (!this._leaving) { this.overlay = { type: 'eula' }; this.draw(); } };
 
       this.input.on('key', this._keyHandler);
+      this.input.on('mouse', this._mouseHandler);
+      try { this.screen.enableMouse(); } catch {}
       process.stdout.on('resize', this._onResize);
-      this.server.on('line', this._redraw);
+      this.server.on('line', this._onLine);
       this.server.on('state', this._redraw);
       this.server.on('players', this._redraw);
+      this.server.on('metrics', this._redraw);
       this.server.on('exit', this._onExit);
       this.server.on('eula', this._onEula);
       this.tunnel.on('update', this._redraw);
@@ -139,14 +144,37 @@ class App {
     clearInterval(this._timer);
     clearInterval(this._perfTimer);
     try { this.input.removeListener('key', this._keyHandler); } catch {}
+    try { this.input.removeListener('mouse', this._mouseHandler); } catch {}
+    try { this.screen.disableMouse(); } catch {}
     try { process.stdout.removeListener('resize', this._onResize); } catch {}
-    for (const ev of ['line', 'state', 'players']) {
+    try { this.server.removeListener('line', this._onLine); } catch {}
+    for (const ev of ['state', 'players', 'metrics']) {
       try { this.server.removeListener(ev, this._redraw); } catch {}
     }
     try { this.server.removeListener('exit', this._onExit); } catch {}
     try { this.server.removeListener('eula', this._onEula); } catch {}
     try { this.tunnel.removeListener('update', this._redraw); } catch {}
     try { this.tunnel.stop(); } catch {}
+  }
+
+  // Keep the scroll position stable when new console lines arrive while the
+  // user has scrolled up; otherwise stay pinned to the bottom.
+  onConsoleLine() {
+    if (this.view === 'console' && this.cScroll > 0) this.cScroll += 1;
+    this.draw();
+  }
+
+  onMouse(m) {
+    if (m.name !== 'click' || this.overlay) return;
+    // Click a tab in the tab bar (row 3) to switch views.
+    if (m.y === 3) {
+      let cx = 1;
+      for (const v of VIEWS) {
+        const label = ` ${VIEWS.indexOf(v) + 1}·${VIEW_LABEL[v]} `;
+        if (m.x >= cx && m.x < cx + label.length) { this.gotoView(v); return; }
+        cx += label.length + 1;
+      }
+    }
   }
 
   samplePerf() {
@@ -167,6 +195,7 @@ class App {
 
   onKey(k) {
     if (this.overlay) return this.onOverlayKey(k);
+    if (k.name === 'wheelup' || k.name === 'wheeldown') return this.onWheel(k);
 
     if (k.name === 'C-c') return this.requestQuit();
     if (k.name === 'C-l') { this.screen.resize(); return this.draw(); }
@@ -175,6 +204,10 @@ class App {
     if (/^f[1-7]$/.test(k.name || '')) return this.gotoView(VIEWS[parseInt(k.name[1], 10) - 1]);
     if (k.name === 'C-r') return this.toggleRun();
 
+    this.dispatchViewKey(k);
+  }
+
+  dispatchViewKey(k) {
     switch (this.view) {
       case 'console': return this.onConsoleKey(k);
       case 'players': return this.onPlayersKey(k);
@@ -184,6 +217,17 @@ class App {
       case 'network': return this.onNetworkKey(k);
       case 'server': return this.onServerKey(k);
     }
+  }
+
+  // Mouse wheel: scroll the console; elsewhere nudge the list selection.
+  onWheel(k) {
+    const up = k.name === 'wheelup';
+    if (this.view === 'console') {
+      this.cScroll = Math.max(0, this.cScroll + (up ? 3 : -3));
+      return this.draw();
+    }
+    const dir = up ? 'up' : 'down';
+    for (let i = 0; i < 3; i++) this.dispatchViewKey({ name: dir });
   }
 
   cycleView(dir) {
@@ -378,10 +422,15 @@ class App {
   refreshPlugins() {
     const pluginsDir = path.join(this.server.dir, 'plugins');
     const modsDir = path.join(this.server.dir, 'mods');
+    // Modded flavors (Fabric/Forge/NeoForge/Quilt) use mods/; everything else
+    // uses plugins/. Honor whichever folder already exists, else the flavor's.
+    const wantsMods = this.server.kind === 'mods';
     let dir = null, kind = '';
-    if (fs.existsSync(pluginsDir)) { dir = pluginsDir; kind = 'plugins'; }
+    if (fs.existsSync(pluginsDir) && !wantsMods) { dir = pluginsDir; kind = 'plugins'; }
+    else if (fs.existsSync(modsDir) && wantsMods) { dir = modsDir; kind = 'mods'; }
+    else if (fs.existsSync(pluginsDir)) { dir = pluginsDir; kind = 'plugins'; }
     else if (fs.existsSync(modsDir)) { dir = modsDir; kind = 'mods'; }
-    else if (['fabric'].includes(this.record.type)) { dir = modsDir; kind = 'mods'; }
+    else if (wantsMods) { dir = modsDir; kind = 'mods'; }
     else { dir = pluginsDir; kind = 'plugins'; }
 
     let entries = [];
@@ -395,64 +444,69 @@ class App {
     this.plug = { dir, kind, entries, sel: Math.min(this.plug.sel, Math.max(0, entries.length - 1)) };
   }
 
-  // Row 0 of the list is the "Add from Modrinth" action; rows 1..n are the jars.
+  // Row 0 is the "Add a plugin/mod" action; rows 1..n are the installed jars.
   onPluginsKey(k) {
     const n = this.plug.entries.length + 1;
     if (k.name === 'up') { this.plug.sel = Math.max(0, this.plug.sel - 1); return this.draw(); }
     if (k.name === 'down') { this.plug.sel = Math.min(n - 1, this.plug.sel + 1); return this.draw(); }
     if (k.name === 'enter') {
-      if (this.plug.sel === 0) return this.openModrinth();
+      if (this.plug.sel === 0) return this.openLibrary();
       const p = this.plug.entries[this.plug.sel - 1];
       if (p) return this.togglePlugin(p);
     }
   }
 
-  // ---- Modrinth browser --------------------------------------------------
+  // ---- plugin/mod library browser (Modrinth / Hangar / SpigotMC) ----------
 
-  openModrinth() {
-    const compat = modrinth.compatFor(this.record.type);
-    if (!compat) {
-      this.plug.msg = `${this.record.type} can't load Modrinth plugins/mods (try Paper or Fabric).`;
+  openLibrary() {
+    const libs = librariesFor(this.record.type);
+    if (!libs.length) {
+      this.plug.msg = `${this.record.type} has no compatible plugin/mod library.`;
       return this.draw();
     }
     this.overlay = {
-      type: 'modrinth', query: '', focus: 'query',
+      type: 'library', libs, libIdx: 0, query: '', focus: 'query',
       loading: false, error: '', results: [], sel: 0, scroll: 0,
       installing: false, msg: '', versionFiltered: true,
     };
-    this.runModrinthSearch();
+    this.runLibrarySearch();
     this.draw();
   }
 
-  onModrinthKey(k) {
+  onLibraryKey(k) {
     const o = this.overlay;
     if (k.name === 'C-c' || k.name === 'escape') { this.overlay = null; return this.draw(); }
     if (o.installing) return;
-    if (k.name === 'up') { o.focus = 'results'; o.sel = Math.max(0, o.sel - 1); return this.draw(); }
-    if (k.name === 'down') { o.focus = 'results'; o.sel = Math.min(o.results.length - 1, o.sel + 1); return this.draw(); }
+    if (k.name === 'tab' || k.name === 'shift-tab') {       // switch library source
+      const d = k.name === 'tab' ? 1 : -1;
+      o.libIdx = (o.libIdx + d + o.libs.length) % o.libs.length;
+      return this.runLibrarySearch();
+    }
+    if (k.name === 'up' || k.name === 'wheelup') { o.focus = 'results'; o.sel = Math.max(0, o.sel - 1); return this.draw(); }
+    if (k.name === 'down' || k.name === 'wheeldown') { o.focus = 'results'; o.sel = Math.min(o.results.length - 1, o.sel + 1); return this.draw(); }
     if (k.name === 'pageup') { o.focus = 'results'; o.sel = Math.max(0, o.sel - 8); return this.draw(); }
     if (k.name === 'pagedown') { o.focus = 'results'; o.sel = Math.min(o.results.length - 1, o.sel + 8); return this.draw(); }
     if (k.name === 'enter') {
-      if (o.focus === 'results' && o.results[o.sel]) return this.installModrinth(o.results[o.sel]);
-      return this.runModrinthSearch();
+      if (o.focus === 'results' && o.results[o.sel]) return this.installLibrary(o.results[o.sel]);
+      return this.runLibrarySearch();
     }
-    // typing edits the query and returns focus to it
     if (k.name === 'backspace') { o.query = o.query.slice(0, -1); o.focus = 'query'; return this.draw(); }
     if (k.name === 'C-u') { o.query = ''; o.focus = 'query'; return this.draw(); }
     if (k.name === 'char') { o.query += k.ch; o.focus = 'query'; return this.draw(); }
   }
 
-  runModrinthSearch() {
+  runLibrarySearch() {
     const o = this.overlay;
-    if (!o || o.type !== 'modrinth') return;
+    if (!o || o.type !== 'library') return;
+    const lib = o.libs[o.libIdx];
     o.loading = true; o.error = ''; o.msg = '';
     this.draw();
-    modrinth.search({ flavor: this.record.type, gameVersion: this.record.version, query: o.query })
+    lib.search({ flavor: this.record.type, gameVersion: this.record.version, query: o.query })
       .then((res) => {
         if (this.overlay !== o) return;
         o.loading = false; o.results = res.hits; o.versionFiltered = res.versionFiltered;
         o.sel = 0; o.scroll = 0; o.focus = res.hits.length ? 'results' : 'query';
-        if (!res.hits.length) o.msg = 'No compatible results.';
+        if (!res.hits.length) o.msg = 'No results.';
         this.draw();
       })
       .catch((e) => {
@@ -462,24 +516,37 @@ class App {
       });
   }
 
-  installModrinth(hit) {
+  installLibrary(hit) {
     const o = this.overlay;
+    const lib = o.libs[o.libIdx];
     o.installing = true; o.msg = 'Resolving ' + hit.title + '…'; o.error = '';
     this.draw();
-    modrinth.resolveFile({ slug: hit.slug, flavor: this.record.type, gameVersion: this.record.version })
+    Promise.resolve(lib.resolveFile({ hit, flavor: this.record.type, gameVersion: this.record.version }))
       .then((file) => {
+        if (this.overlay !== o) return;
+        if (!file.url && file.browseUrl) {     // can't auto-install (external/premium)
+          o.installing = false;
+          o.msg = `Hosted externally${file.note ? ' (' + file.note + ')' : ''} — download at: ${file.browseUrl}`;
+          return this.draw();
+        }
         try { fs.mkdirSync(this.plug.dir, { recursive: true }); } catch {}
         const dest = path.join(this.plug.dir, file.filename);
         o.msg = 'Downloading ' + file.filename + '…';
         this.draw();
-        return download(file.url, dest, () => {}).then(() => file);
-      })
-      .then((file) => {
-        if (this.overlay !== o) return;
-        o.installing = false;
-        o.msg = `Installed ${file.filename} — restart to load.`;
-        this.refreshPlugins();
-        this.draw();
+        return download(file.url, dest, () => {}).then(() => {
+          if (this.overlay !== o) return;
+          // Some mirrors return an HTML page instead of a jar — verify the magic.
+          if (file.fragile && !looksLikeJar(dest)) {
+            try { fs.unlinkSync(dest); } catch {}
+            o.installing = false;
+            o.msg = `Couldn't fetch directly — open: ${file.browseUrl || '(source page)'}`;
+            return this.draw();
+          }
+          o.installing = false;
+          o.msg = `Installed ${file.filename} — restart to load.`;
+          this.refreshPlugins();
+          this.draw();
+        });
       })
       .catch((e) => {
         if (this.overlay !== o) return;
@@ -634,7 +701,7 @@ class App {
   onOverlayKey(k) {
     const o = this.overlay;
     if (o.type === 'stopping') return; // busy, ignore input
-    if (o.type === 'modrinth') return this.onModrinthKey(k);
+    if (o.type === 'library') return this.onLibraryKey(k);
     if (o.type === 'stopped') {
       if (k.name === 'char' && /[rR]/.test(k.ch)) { this.overlay = null; this.server.start(); return this.draw(); }
       if (k.name === 'char' && /[bB]/.test(k.ch)) { this.overlay = null; return this.backToLauncher(); }
@@ -804,19 +871,21 @@ class App {
       s.text(cx, y, label, on ? C.selFg + C.bold : C.muted);
       cx += label.length + 1;
     });
-    const hint = 'Tab/F1-6 switch';
+    const hint = 'Tab/F1-7 switch';
     s.text(W - hint.length - 1, y, hint, C.faint);
   }
 
   // ---- console view ----
   drawConsole(r) {
     const s = this.screen;
-    s.box(r.x, r.y, r.w, r.h, { style: C.borderHot, title: 'Console', titleStyle: C.title });
-    const innerW = r.w - 4, rows = r.h - 2;
     const lines = this.server.console;
-    // wrap tail
+    const title = `Console · ${lines.length} lines` + (this.cScroll > 0 ? `  ⤒ scrolled +${this.cScroll}` : '');
+    s.box(r.x, r.y, r.w, r.h, { style: C.borderHot, title, titleStyle: C.title });
+    const rows = r.h - 2;
+    const sbX = r.x + r.w - 2;        // scrollbar column, just inside the border
+    const innerW = r.w - 5;           // leave room for the scrollbar
     const wrapped = [];
-    const start = Math.max(0, lines.length - rows - this.cScroll - 40);
+    const start = Math.max(0, lines.length - rows - this.cScroll - 60);
     for (let i = start; i < lines.length; i++) {
       const e = lines[i];
       for (const seg of wrap(e.text, innerW)) wrapped.push({ text: seg, level: e.level });
@@ -827,11 +896,19 @@ class App {
     const from = Math.max(0, end - rows);
     let yy = r.y + 1;
     for (let i = from; i < end; i++) {
-      const e = wrapped[i];
-      s.ansiText(r.x + 2, yy, e.text, levelStyle(e.level), innerW);
+      s.ansiText(r.x + 2, yy, wrapped[i].text, levelStyle(wrapped[i].level), innerW);
       yy++;
     }
-    if (this.cScroll > 0) s.text(r.x + r.w - 7, r.y, '↑more', C.gold);
+    // scrollbar (thumb position: bottom = newest)
+    if (wrapped.length > rows) {
+      const frac = maxScroll > 0 ? this.cScroll / maxScroll : 0;
+      const thumb = Math.max(1, Math.round((rows * rows) / wrapped.length));
+      const top = Math.round((1 - frac) * (rows - thumb));
+      for (let i = 0; i < rows; i++) {
+        const on = i >= top && i < top + thumb;
+        s.put(sbX, r.y + 1 + i, on ? '█' : '│', on ? C.borderHot : C.faint);
+      }
+    }
   }
 
   // ---- players view ----
@@ -907,9 +984,8 @@ class App {
       const style = sel ? C.selFg + C.bold : it.dir ? C.cyan : C.text;
       s.text(r.x + 2, y, `${icon} ${it.name}`, style, r.w - 4);
     }
-    const note = this.files.error ? (C.red + this.files.error)
-      : C.faint + 'Enter: open folder / view file';
-    s.text(r.x + 2, r.y + r.h - 1, note, '', r.w - 4);
+    const note = this.files.error || 'Enter: open folder / view file';
+    s.text(r.x + 2, r.y + r.h - 1, note, this.files.error ? C.red : C.faint, r.w - 4);
   }
 
   drawViewer(r) {
@@ -955,13 +1031,13 @@ class App {
       const y = r.y + 1 + i;
       if (sel) s.fillRect(r.x + 1, y, r.w - 2, 1, ' ', C.selBg);
       if (idx === 0) {
-        const can = !!modrinth.compatFor(this.record.type);
-        s.text(r.x + 2, y, '🔍 Add from Modrinth…', sel ? C.selFg + C.bold : can ? C.cyan : C.faint, r.w - 4);
+        const libs = librariesFor(this.record.type);
+        const label = libs.length ? `+ Add (${libs.map((l) => l.name).join('/')})…` : '+ Add (no library for this flavor)';
+        s.text(r.x + 2, y, label, sel ? C.selFg + C.bold : libs.length ? C.cyan : C.faint, r.w - 4);
       } else {
         const p = e[idx - 1];
-        const dot = p.enabled ? C.green + '●' : C.faint + '○';
         const name = p.file.replace(/\.disabled$/i, '');
-        s.text(r.x + 2, y, dot + ' ', '');
+        s.text(r.x + 2, y, p.enabled ? '●' : '○', p.enabled ? C.green : C.faint);
         s.text(r.x + 4, y, name, sel ? C.selFg + C.bold : p.enabled ? C.text : C.muted, r.w - 16);
         const sz = fmtSize(p.size);
         s.text(r.x + r.w - sz.length - 2, y, sz, sel ? C.selFg : C.faint);
@@ -1173,38 +1249,46 @@ class App {
     const s = this.screen;
     s.box(r.x, r.y, r.w, r.h, { style: C.border, title: 'Status', titleStyle: C.title });
     const x = r.x + 2, endX = r.x + r.w - 2;
+    const bottom = r.y + r.h - 1;
     let y = r.y + 1;
-    const dot = this.statusDot();
-    this.kv(x, y++, 'State', dot.label, dot.style, endX);
-    this.kv(x, y++, 'Uptime', this.uptime(), C.white, endX);
-    const max = this.server.maxPlayers || this.record.maxPlayers || '?';
-    this.kv(x, y++, 'Players', `${this.server.playerList().length}/${max}`, C.green, endX);
-    y++;
-    s.text(x, y++, 'Server process', C.muted);
-    this.kv(x, y++, 'RAM', this.perf.rssMB ? fmtMB(this.perf.rssMB) : '—', memColor(this.perf.rssMB), endX);
-    this.kv(x, y++, 'Alloc', fmtRam(this.record.ram || 0), C.faint, endX);
-    this.kv(x, y++, 'CPU', this.server.child ? this.perf.cpu.toFixed(0) + '%' : '—', cpuColor(this.perf.cpu), endX);
-    y++;
-    s.text(x, y++, 'Host', C.muted);
-    const memPct = this.perf.memTotal ? (this.perf.memUsed / this.perf.memTotal * 100) : 0;
-    this.kv(x, y++, 'Mem', `${fmtMB(this.perf.memUsed)}/${fmtMB(this.perf.memTotal)}`, memColor2(memPct), endX);
-    this.kv(x, y++, 'Load', this.perf.load.toFixed(2), C.white, endX);
-    this.kv(x, y++, 'Port', String(this.serverPort()), C.gold, endX);
-    y++;
-    const online = this.tunnel.status === 'online';
-    s.text(x, y++, 'Access', C.muted);
-    if (online) this.kv(x, y++, 'Tunnel', this.tunnel.provider ? this.tunnel.provider.name : 'on', C.green, endX);
-    const join = this.joinAddress();
-    s.text(x, y++, 'Join', C.muted);
-    s.text(x, y++, join || '—', online ? C.green + C.bold : join ? C.cyan : C.faint, r.w - 3);
+    const M = this.server.metrics;
+    const running = this.server.status === STATUS.RUNNING;
+    // height-aware writers: stop cleanly instead of bleeding past the box
+    const head = (t) => { if (y < bottom) s.text(x, y++, t, C.muted); };
+    const kv = (k, v, st) => { if (y < bottom) this.kv(x, y++, k, v, st, endX); };
+    const gap = () => { if (y < bottom - 1) y++; };
 
-    // mini console tail at the bottom of the sidebar (handy off the Console tab)
-    if (this.view !== 'console' && r.h > 22) {
-      const tailY = r.y + r.h - 6;
-      s.text(x, tailY, 'Recent', C.muted);
-      const tail = this.server.console.slice(-4);
-      tail.forEach((e, i) => s.ansiText(x, tailY + 1 + i, stripTs(e.text), levelStyle(e.level), r.w - 3));
+    const dot = this.statusDot();
+    kv('State', dot.label, dot.style);
+    kv('Uptime', this.uptime(), C.white);
+    if (this.server.category !== 'proxy') {
+      const max = this.server.maxPlayers || this.record.maxPlayers || '?';
+      kv('Players', `${this.server.playerList().length}/${max}`, C.green);
     }
+    gap();
+    head('Performance');
+    if (this.server.tpsSupported) {
+      kv('TPS', running && M.tps != null ? M.tps.toFixed(1) : '—', tpsColor(M.tps, running));
+      if (this.server.isPaperFamily()) kv('MSPT', running && M.mspt != null ? M.mspt.toFixed(1) : '—', msptColor(M.mspt, running));
+    }
+    kv('RAM', this.perf.rssMB ? fmtMB(this.perf.rssMB) : '—', memColor(this.perf.rssMB));
+    kv('Alloc', fmtRam(this.record.ram || 0), C.faint);
+    kv('CPU', this.server.child ? this.perf.cpu.toFixed(0) + '%' : '—', cpuColor(this.perf.cpu));
+    if (this.server.kind !== 'none') kv(this.server.kind === 'mods' ? 'Mods' : 'Plugins', M.content == null ? '—' : String(M.content), C.white);
+    kv('World', M.worldMB == null ? '—' : fmtMB(M.worldMB), C.faint);
+    gap();
+    head('Host');
+    const memPct = this.perf.memTotal ? (this.perf.memUsed / this.perf.memTotal * 100) : 0;
+    kv('Mem', `${fmtMB(this.perf.memUsed)}/${fmtMB(this.perf.memTotal)}`, memColor2(memPct));
+    kv('Load', this.perf.load.toFixed(2), C.white);
+    kv('Port', String(this.serverPort()), C.gold);
+    gap();
+    const online = this.tunnel.status === 'online';
+    head('Access');
+    if (online) kv('Tunnel', this.tunnel.provider ? this.tunnel.provider.name : 'on', C.green);
+    const join = this.joinAddress();
+    if (y < bottom) s.text(x, y++, 'Join', C.muted);
+    if (y < bottom) s.text(x, y++, join || '—', online ? C.green + C.bold : join ? C.cyan : C.faint, r.w - 3);
   }
 
   kv(x, y, label, val, vstyle, endX) {
@@ -1252,7 +1336,7 @@ class App {
     const s = this.screen;
     const o = this.overlay;
     if (o.type === 'player') return this.drawPlayerMenu(W, H);
-    if (o.type === 'modrinth') return this.drawModrinth(W, H);
+    if (o.type === 'library') return this.drawLibrary(W, H);
     const w = Math.min(60, W - 6);
     const h = o.type === 'eula' ? 11 : o.type === 'stopped' ? 11 : 9;
     const x = Math.floor((W - w) / 2), y = Math.floor((H - h) / 2);
@@ -1290,27 +1374,37 @@ class App {
     }[o.type] || '';
   }
 
-  drawModrinth(W, H) {
+  drawLibrary(W, H) {
     const s = this.screen;
     const o = this.overlay;
-    const w = Math.min(84, W - 4), h = Math.min(26, H - 2);
+    const w = Math.min(86, W - 4), h = Math.min(27, H - 2);
     const x = Math.floor((W - w) / 2), y = Math.floor((H - h) / 2);
     s.fillRect(x, y, w, h, ' ', '');
-    const kind = this.record.type === 'fabric' || this.record.type === 'quilt' ? 'mods' : 'plugins';
+    const kind = this.server.kind === 'mods' ? 'mods' : 'plugins';
     s.box(x, y, w, h, {
       style: C.borderHot,
-      title: `Modrinth · ${kind} for ${this.record.type} ${this.record.version}`,
+      title: `Add ${kind} · ${this.record.type} ${this.record.version}`,
       titleStyle: C.title + C.bold,
     });
+    // library source switcher (Tab to cycle)
+    let cx = x + 2;
+    o.libs.forEach((lib, i) => {
+      const on = i === o.libIdx;
+      const lbl = ` ${lib.name} `;
+      if (on) s.fillRect(cx, y + 1, lbl.length, 1, ' ', C.selBg);
+      s.text(cx, y + 1, lbl, on ? C.selFg + C.bold : C.muted);
+      cx += lbl.length + 1;
+    });
+    s.text(x + w - 14, y + 1, 'Tab ▸ source', C.faint);
     // search field
     const qActive = o.focus === 'query';
-    s.text(x + 2, y + 1, 'Search', qActive ? C.borderHot + C.bold : C.muted);
-    s.box(x + 2, y + 2, w - 4, 3, { style: qActive ? C.borderHot : C.border });
-    s.text(x + 4, y + 3, o.query || (qActive ? '' : 'type and press Enter…'), o.query ? C.white : C.faint, w - 8);
+    s.text(x + 2, y + 2, 'Search', qActive ? C.borderHot + C.bold : C.muted);
+    s.box(x + 2, y + 3, w - 4, 3, { style: qActive ? C.borderHot : C.border });
+    s.text(x + 4, y + 4, o.query || (qActive ? '' : 'type and press Enter…'), o.query ? C.white : C.faint, w - 8);
 
-    const listY = y + 6, listH = h - 8;
+    const listY = y + 7, listH = h - 9;
     if (o.loading) {
-      s.text(x + 3, listY, this.spinner() + '  searching Modrinth…', C.gold);
+      s.text(x + 3, listY, this.spinner() + `  searching ${o.libs[o.libIdx].name}…`, C.gold);
     } else if (o.error) {
       s.text(x + 3, listY, o.error, C.red, w - 6);
     } else if (!o.results.length) {
@@ -1334,12 +1428,12 @@ class App {
     // footer
     let note;
     if (o.installing) note = this.spinner() + '  ' + o.msg;
-    else if (o.msg && o.results.length) note = o.msg;
-    else note = 'type to search · Enter search/install · ↑↓ pick · Esc close';
-    if (!o.versionFiltered && !o.loading && o.results.length) {
-      note = '⚠ version unknown — results not version-filtered · ' + note;
+    else if (o.msg) note = o.msg;
+    else note = 'type to search · Enter install · ↑↓ pick · Tab source · Esc close';
+    if (!o.versionFiltered && !o.loading && o.results.length && !o.msg) {
+      note = '⚠ not version-filtered by this source · ' + note;
     }
-    s.text(x + 2, y + h - 1, ' ' + note + ' ', o.installing ? C.gold : C.faint, w - 4);
+    s.text(x + 2, y + h - 1, ' ' + note + ' ', o.installing ? C.gold : (o.error ? C.red : C.faint), w - 4);
   }
 
   drawPlayerMenu(W, H) {
@@ -1398,6 +1492,20 @@ function fmtSize(b) {
 function memColor(mb) { return !mb ? C.faint : mb < 1024 ? C.green : mb < 3072 ? C.gold : C.red; }
 function memColor2(pct) { return pct < 70 ? C.green : pct < 88 ? C.gold : C.red; }
 function cpuColor(p) { return p < 50 ? C.green : p < 85 ? C.gold : C.red; }
+function tpsColor(t, running) { return !running || t == null ? C.faint : t >= 19 ? C.green : t >= 15 ? C.gold : C.red; }
+function msptColor(m, running) { return !running || m == null ? C.faint : m <= 30 ? C.green : m <= 45 ? C.gold : C.red; }
+
+// Cheap sanity check that a downloaded file is really a jar (ZIP "PK" magic),
+// so a mirror that returns an HTML error page doesn't masquerade as a plugin.
+function looksLikeJar(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(2);
+    fs.readSync(fd, buf, 0, 2, 0);
+    fs.closeSync(fd);
+    return buf[0] === 0x50 && buf[1] === 0x4b; // 'PK'
+  } catch { return false; }
+}
 
 function since(t) {
   const sec = Math.floor((Date.now() - t) / 1000);
@@ -1436,14 +1544,21 @@ function wrap(str, width) {
   const s = String(str);
   let i = 0;
   while (i < s.length) {
-    if (s[i] === '\x1b' && s[i + 1] === '[') {
-      let j = i + 2;
-      while (j < s.length && s[j] !== 'm') j++;
-      const code = s.slice(i, j + 1);
-      row += code;
-      if (/\x1b\[0?m/.test(code)) active = '';
-      else active += code;
-      i = j + 1;
+    if (s[i] === '\x1b') {
+      if (s[i + 1] === '[') {
+        let j = i + 2;
+        while (j < s.length && j < i + 32 && !/[A-Za-z]/.test(s[j])) j++;
+        const final = s[j];
+        const code = s.slice(i, j + 1);
+        if (final === 'm') {
+          row += code;
+          if (/\x1b\[0?m/.test(code)) active = '';
+          else active += code;
+        }
+        i = j + 1;
+      } else {
+        i++; // bare ESC — skip
+      }
       continue;
     }
     row += s[i]; visible++; i++;

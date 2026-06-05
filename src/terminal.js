@@ -95,9 +95,13 @@ class Screen {
     }
   }
 
-  // Place a single styled character.
+  // Place a single styled character. Control characters are never stored — if
+  // one slipped through (e.g. a stray byte in server output) it would be emitted
+  // raw during render() and corrupt the whole screen, so we blank it instead.
   put(x, y, ch, style = '') {
     if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
+    const cp = ch.codePointAt(0);
+    if (cp < 32 || cp === 127) ch = ' ';
     const cell = this.buf[y * this.width + x];
     cell.ch = ch;
     cell.style = style;
@@ -125,13 +129,22 @@ class Screen {
     let i = 0;
     const s = String(str);
     while (i < s.length && cx < limit) {
-      if (s[i] === '\x1b' && s[i + 1] === '[') {
-        let j = i + 2;
-        while (j < s.length && s[j] !== 'm') j++;
-        const code = s.slice(i, j + 1);
-        if (/\x1b\[0?m/.test(code)) style = baseStyle;
-        else style = style + code;
-        i = j + 1;
+      if (s[i] === '\x1b') {
+        // Honor SGR color codes (\x1b[…m); drop every other escape sequence so a
+        // stray cursor-move or partial code can't swallow text or corrupt output.
+        if (s[i + 1] === '[') {
+          let j = i + 2;
+          while (j < s.length && j < i + 32 && !/[A-Za-z]/.test(s[j])) j++;
+          const final = s[j];
+          const code = s.slice(i, j + 1);
+          if (final === 'm') {
+            if (/\x1b\[0?m/.test(code)) style = baseStyle;
+            else style = style + code;
+          }
+          i = j + 1;
+        } else {
+          i++; // bare ESC — skip it
+        }
         continue;
       }
       if (s[i] === '\n') break;
@@ -209,6 +222,9 @@ class Screen {
   showCursor() { this.out.write(`${ESC}?25h`); }
   enterAlt() { this.out.write(`${ESC}?1049h`); }
   leaveAlt() { this.out.write(`${ESC}?1049l`); }
+  // Button + SGR mouse reporting (gives us wheel + clicks without drag spam).
+  enableMouse() { this.out.write(`${ESC}?1000h${ESC}?1006h`); }
+  disableMouse() { this.out.write(`${ESC}?1006l${ESC}?1000l`); }
 
   // Move the *real* terminal cursor (used to show the input caret).
   placeCursor(x, y) {
@@ -239,6 +255,20 @@ class Input extends EventEmitter {
   }
 
   _onData(d) {
+    // SGR mouse reports: \x1b[<button;col;rowM (press) / m (release).
+    if (d.indexOf('\x1b[<') !== -1) {
+      const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+      let mm, any = false;
+      while ((mm = re.exec(d))) {
+        any = true;
+        const b = +mm[1], x = +mm[2] - 1, y = +mm[3] - 1, pressed = mm[4] === 'M';
+        if (b === 64) this.emit('key', { name: 'wheelup', x, y });
+        else if (b === 65) this.emit('key', { name: 'wheeldown', x, y });
+        else if (pressed && (b & 0b11) === 0) this.emit('mouse', { name: 'click', x, y, button: b });
+      }
+      if (any) return;
+    }
+
     // Multi-byte escape sequences (arrows, navigation, function keys).
     switch (d) {
       case '\x1b[A': return this.emit('key', { name: 'up' });

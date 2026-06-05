@@ -4,7 +4,8 @@
   A <strong>terminal-only control panel for Minecraft Java servers</strong> — no web
   dashboard, no Docker, no daemon. It runs your server jar as-is and wraps the
   whole thing in a polished TUI with rounded borders: console, players,
-  <code>server.properties</code>, files/configs, and plugins, all a Tab away.
+  <code>server.properties</code>, files/configs, plugins/mods, live telemetry,
+  and one-click public access, all a Tab away.
 </p>
 
 <p align="center">
@@ -20,20 +21,20 @@
 ╭──────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ▘ yasc   ● running          Survival SMP  ·  paper 1.21.11           up 1h02m05s   02:17:37    │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────╯
- 1·Console  2·Players  3·Properties  4·Files  5·Plugins  6·Server            Tab/F1-6 switch
+ 1·Console  2·Players  3·Properties  4·Files  5·Plugins  6·Network  7·Server     Tab/F1-7 switch
 ╭─ Console ───────────────────────────────────────────────────────────────╮╭─ Status ──────────╮
 │ [12:00:00] [Server thread/INFO]: Done (5.231s)! For help, type "help"    ││ State   running   │
 │ [12:00:05] [Server thread/INFO]: Notch joined the game                   ││ Uptime  1h02m05s  │
 │ > say welcome to the server                                              ││ Players 2/20      │
 │ [12:00:11] [Server thread/WARN]: Can't keep up! Is the server overloaded?││                   │
-│ [12:00:14] [Server thread/INFO]: <Notch> hey all                         ││ Server process    │
+│ [12:00:14] [Server thread/INFO]: <Notch> hey all                         ││ Performance       │
+│                                                                          ││ TPS     19.9      │
+│                                                                          ││ MSPT    6.4       │
 │                                                                          ││ RAM     1.3G      │
-│                                                                          ││ Alloc   2G        │
-│                                                                          ││ CPU     42%       │
 │                                                                          ││                   │
-│                                                                          ││ Host              │
+│                                                                          ││ CPU     42%       │
+│                                                                          ││ Plugins 4         │
 │                                                                          ││ Mem     9G/16G    │
-│                                                                          ││ Load    1.23      │
 │                                                                          ││ Port    25565     │
 ╰──────────────────────────────────────────────────────────────────────────╯╰───────────────────╯
 ╭──────────────────────────────────────────────────────────────────────────────────────────────╮
@@ -60,21 +61,32 @@
   agent, no re-packaging. Anything that works on the command line works here.
 - **Start fresh or import.** On launch you either pick a saved server, **import
   an existing folder** that already has a server jar, or **create a new one** by
-  choosing a flavor + version that yasc downloads for you.
-- **One panel for everything**, navigable entirely from the keyboard:
-  - **Console** — live colored server log with scrollback, plus a command line
-    (with history) that pipes straight to the server.
+  choosing a flavor + version that yasc downloads (and, for Forge/NeoForge,
+  installs) for you.
+- **Every flavor, every niche.** Vanilla; the Bukkit/Spigot plugin servers
+  **Paper, Folia, Purpur**; the mod loaders **Fabric, Forge, NeoForge**; and the
+  proxies **Velocity, Waterfall, BungeeCord** — each downloaded from its own
+  official source, with the right launch (EULA + `nogui` for game servers, no
+  EULA for proxies, installer handling for Forge/NeoForge). Spigot/CraftBukkit
+  (which can't be redistributed) are supported via **import**.
+- **One panel for everything**, navigable entirely from the keyboard *and mouse*:
+  - **Console** — live colored server log with a real **scrollback** (mouse
+    wheel or `PgUp`/`PgDn`, with a scrollbar and stable position while new lines
+    stream in), plus a command line with history that pipes straight to the
+    server.
   - **Players** — who's online and for how long, with an Enter-menu to op / deop
     / kick / ban / whitelist without remembering the syntax.
   - **Properties** — a live editor for `server.properties` that preserves your
     comments and key order, writing changes straight back to disk.
   - **Files** — browse the server directory and open any text config in a
     scrolling viewer you can edit line-by-line (`Ctrl+S` to save).
-  - **Plugins / Mods** — list the jars in `plugins/` (or `mods/` for Fabric),
+  - **Plugins / Mods** — list the jars in `plugins/` (or `mods/` for modded),
     toggle each one on/off (it renames to `.jar.disabled`), and **browse +
-    install straight from [Modrinth](https://modrinth.com)** — the results are
-    pre-filtered to only what's compatible with *this* flavor **and** *this*
-    Minecraft version, so you can't install a plugin that won't load.
+    install from a choice of libraries**: [Modrinth](https://modrinth.com)
+    (everything), [Hangar](https://hangar.papermc.io) (Paper/Velocity/Waterfall),
+    and [SpigotMC](https://www.spigotmc.org) (Bukkit/Spigot). `Tab` switches
+    source; only the libraries that fit your flavor are shown, and Modrinth
+    results are pre-filtered to *this* flavor **and** *this* Minecraft version.
   - **Network** — *make the server reachable by friends.* Shows your LAN + public
     IP and the exact join address, and offers every common way to expose it:
     manual port-forward instructions with a real **external reachability test**,
@@ -84,8 +96,11 @@
     live, no router config needed.
   - **Server** — the control center: Start / Stop / Restart / Force-kill, accept
     the EULA, and see the jar, Java, memory and port at a glance.
-- **Live status sidebar** — server state, uptime, player count, the Java
-  process's RAM/CPU, host memory + load, and the listening port, always visible.
+- **Live telemetry sidebar** — server state, uptime, player count; **TPS** and
+  **MSPT** (polled quietly so they never spam the console — Paper-family & Forge),
+  the Java process's RAM/CPU, plugin/mod count and world size on disk; host
+  memory + load; the listening port and current public/tunnel join address —
+  always visible from every tab.
 - **Lightweight & zero-dependency.** Pure Node built-ins (`child_process`,
   `https`, `fs`) and a custom diff renderer, so an idle panel barely costs any
   CPU and there's nothing to `npm audit`.
@@ -115,14 +130,16 @@ You land on the home screen. Three things can happen there:
 
 1. **Open a saved server** — anything you've created or imported before.
 2. **＋ Create a new server** —
-   1. pick a **flavor**: Vanilla, Paper, Purpur, or Fabric;
+   1. pick a **flavor** (`↑`/`↓` through Vanilla · Paper/Folia/Purpur ·
+      Fabric/Forge/NeoForge · Velocity/Waterfall/BungeeCord);
    2. pick a **version** (the list is fetched live; type to filter, newest first);
    3. name it and set its **memory** (e.g. `2G`);
-   4. accept the **Minecraft EULA**.
+   4. accept the **Minecraft EULA** (skipped for proxies, which don't need one).
 
-   yasc downloads the right server jar, writes `eula.txt`, lays down a sane
-   default `server.properties`, and drops you into the panel with the server
-   starting.
+   yasc downloads the right server jar — running the installer first for
+   Forge/NeoForge — writes `eula.txt`, lays down a sane default
+   `server.properties` (game servers only), and drops you into the panel with
+   the server starting.
 3. **⮈ Import an existing folder** — point it at any directory that already
    contains a server jar (your current worlds, plugins and configs are left
    exactly as they are). Pick the jar, give it a name and memory, and you're in.
@@ -137,11 +154,11 @@ restarting yasc.
 
 | # | View | What you can do |
 |---|------|-----------------|
-| 1 | **Console** | read the live log, scroll (`PgUp`/`PgDn`), send commands, recall history (`↑`/`↓`) |
+| 1 | **Console** | read the live log, scroll (mouse wheel / `PgUp`/`PgDn`), send commands, recall history (`↑`/`↓`) |
 | 2 | **Players** | see who's online; `Enter` opens op/kick/ban/whitelist actions |
 | 3 | **Properties** | `↑`/`↓` a key, `Enter` to edit its value — saved to `server.properties` |
 | 4 | **Files** | browse the folder, open a text config, `Enter` a line to edit it, `Ctrl+S` to save |
-| 5 | **Plugins** | toggle plugin/mod jars, or `Enter` the top row to **search & install from Modrinth** |
+| 5 | **Plugins** | toggle plugin/mod jars, or `Enter` the top row to **search & install** from Modrinth / Hangar / SpigotMC (`Tab` switches source) |
 | 6 | **Network** | LAN/public IP + join address; test reachability, UPnP-forward, or start a tunnel |
 | 7 | **Server** | Start / Stop / Restart / Force-kill, accept EULA, **back to server list**, view jar/Java/RAM/port |
 
@@ -177,10 +194,11 @@ terminal.
 | `Ctrl+R` | start the server, or restart it if it's running |
 | `Ctrl+C` | quit the panel (offers to stop the server first if it's running) |
 | `Ctrl+L` | force a full redraw |
+| mouse wheel | scroll the console / move the selection; click a tab to switch view |
 
 **Console view:** type a command + `Enter` to send it · `↑`/`↓` command history ·
-`PgUp`/`PgDn` scroll · `Esc` clear the line.
-**List views:** `↑`/`↓` to move, `Enter` to act, `Esc` to back out.
+mouse wheel or `PgUp`/`PgDn` scroll · `Esc` clear the line.
+**List views:** `↑`/`↓` (or wheel) to move, `Enter` to act, `Esc` to back out.
 **Editors (properties / files):** `Enter` edit · `Ctrl+S` save · `Esc` cancel.
 
 ## Where things live
@@ -205,20 +223,21 @@ hand it over for bug reports. Your server still writes its own
 There is no magic and no background service. [`src/server.js`](src/server.js)
 `spawn`s the Java process in the server's directory, line-buffers its console,
 classifies each line (info / warn / error), and parses the meaningful ones
-("Done!", join/leave, the `list` reply) into live state. Commands you type are
-written to the process's stdin exactly as a console operator would. Everything
-you see is painted by a small custom terminal engine in
-[`src/terminal.js`](src/terminal.js) that keeps an in-memory cell buffer and
-emits only the cells that changed each frame.
+("Done!", join/leave, the `list` reply, and quietly-polled `tps`/`mspt`) into
+live state. Commands you type are written to the process's stdin exactly as a
+console operator would. Everything you see is painted by a small custom terminal
+engine in [`src/terminal.js`](src/terminal.js) that keeps an in-memory cell
+buffer and emits only the cells that changed each frame.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/index.js`](src/index.js) | entry point; logging, wires launcher → download → app |
+| [`src/index.js`](src/index.js) | entry point; logging, wires launcher → download/install → app |
 | [`src/launcher.js`](src/launcher.js) | the home screen / create / import wizard |
-| [`src/app.js`](src/app.js) | the panel: tabs, views, sidebar, input routing |
-| [`src/server.js`](src/server.js) | spawns + supervises the Java server, parses console |
-| [`src/providers.js`](src/providers.js) | version lists + jar downloads (Vanilla/Paper/Purpur/Fabric) |
-| [`src/modrinth.js`](src/modrinth.js) | compatible plugin/mod search + install from Modrinth |
+| [`src/app.js`](src/app.js) | the panel: tabs, views, sidebar, telemetry, input/mouse routing |
+| [`src/server.js`](src/server.js) | spawns + supervises the Java server, parses console, polls TPS |
+| [`src/providers.js`](src/providers.js) | version lists + jar/installer downloads for every flavor |
+| [`src/libraries.js`](src/libraries.js) | unified plugin/mod search + install (Modrinth/Hangar/SpigotMC) |
+| [`src/modrinth.js`](src/modrinth.js) | Modrinth API + per-flavor compatibility mapping |
 | [`src/network.js`](src/network.js) | LAN/public IP + external port-reachability check |
 | [`src/upnp.js`](src/upnp.js) | automatic port forwarding via UPnP IGD (SSDP + SOAP) |
 | [`src/tunnels.js`](src/tunnels.js) | runs tunnel agents (playit.gg/ngrok/bore) + parses their output |
@@ -238,10 +257,17 @@ npm test        # node test/render-test.js
 ## Notes &amp; disclaimer
 
 - Version lists and jars come straight from each project's own authoritative
-  API (Mojang, PaperMC's v3 *fill* API, PurpurMC, FabricMC), so the "latest"
-  you're offered really is the latest. Plugins/mods are fetched from Modrinth.
-  You must accept the [Minecraft EULA](https://aka.ms/MinecraftEULA) to run a
-  server — yasc asks before it ever starts one.
+  source (Mojang, PaperMC's v3 *fill* API for Paper/Folia/Velocity/Waterfall,
+  PurpurMC, FabricMC, the Forge promotions feed, the NeoForge Maven, and the
+  BungeeCord CI), so the "latest" you're offered really is the latest.
+  Plugins/mods come from Modrinth, Hangar, and SpigotMC; Hangar/SpigotMC entries
+  that are hosted off-site or premium can't be auto-installed, so yasc links you
+  to the download instead. You must accept the
+  [Minecraft EULA](https://aka.ms/MinecraftEULA) to run a game server — yasc asks
+  before it ever starts one (proxies need no EULA).
+- **Forge/NeoForge** download an *installer* that yasc runs once (`--installServer`)
+  before first launch, then starts the server via the generated run arguments.
+  This is the heaviest path and needs a matching Java version for that MC release.
 - Closing the panel offers to stop the server cleanly first; if you choose to
   quit while it's running, the child process is stopped so you don't leave an
   orphaned server holding the port.

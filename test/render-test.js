@@ -56,11 +56,23 @@ function makeApp(w, h) {
   server.pushLine('[12:00:10] [Server thread/WARN]: Can\'t keep up! Is the server overloaded?', 'warn');
   server.pushLine('[12:00:11] [Server thread/ERROR]: java.lang.NullPointerException', 'error');
 
+  server.metrics = { tps: 19.8, tps5: 20, tps15: 20, mspt: 6.4, worldMB: 184.2, content: 4 };
   const app = new App(makeScreen(w, h), input, server, { java: { version: '25.0.3', bin: 'java' } });
   app.perf = { rssMB: 1340, cpu: 42, memUsed: 9200, memTotal: 16000, load: 1.23 };
   app.refreshFiles();
   app.refreshPlugins();
   app.loadProps();
+  return app;
+}
+
+// A proxy-flavor app to exercise the no-EULA / no-TPS / proxy code paths.
+function makeProxyApp(w, h) {
+  const prec = { name: 'Hub Proxy', dir, jar: 'velocity.jar', type: 'velocity', version: '3.4.0', ram: 1024, java: 'java', category: 'proxy', kind: 'plugins', eula: false, nogui: false };
+  const server = new MinecraftServer(prec);
+  server.status = STATUS.RUNNING; server.startedAt = Date.now() - 90000;
+  const app = new App(makeScreen(w, h), input, server, { java: { version: '25.0.3', bin: 'java' } });
+  app.perf = { rssMB: 220, cpu: 3, memUsed: 9200, memTotal: 16000, load: 0.4 };
+  app.refreshPlugins();
   return app;
 }
 
@@ -78,24 +90,33 @@ function tryDraw(label, fn) {
 for (const [w, h] of sizes) {
   for (const v of views) {
     tryDraw(`${w}x${h} ${v}`, () => { const a = makeApp(w, h); a.view = v; a._draw(); });
+    tryDraw(`${w}x${h} proxy ${v}`, () => { const a = makeProxyApp(w, h); a.view = v; a._draw(); });
   }
+  // console scrolled up (scrollbar + stable-scroll path)
+  tryDraw(`${w}x${h} console-scrolled`, () => {
+    const a = makeApp(w, h);
+    for (let i = 0; i < 60; i++) a.server.pushLine(`[12:0${i % 6}:00] [INFO]: log line number ${i} with some length to wrap nicely`, 'info');
+    a.view = 'console'; a.cScroll = 8; a._draw();
+  });
   // overlays + sub-states on the default size
   tryDraw(`${w}x${h} overlay:eula`, () => { const a = makeApp(w, h); a.overlay = { type: 'eula' }; a._draw(); });
   tryDraw(`${w}x${h} overlay:quit`, () => { const a = makeApp(w, h); a.overlay = { type: 'quit' }; a._draw(); });
   tryDraw(`${w}x${h} overlay:stopped`, () => { const a = makeApp(w, h); a.overlay = { type: 'stopped', crashed: false }; a._draw(); });
   tryDraw(`${w}x${h} overlay:crashed`, () => { const a = makeApp(w, h); a.overlay = { type: 'stopped', crashed: true }; a._draw(); });
   tryDraw(`${w}x${h} overlay:stopping`, () => { const a = makeApp(w, h); a.overlay = { type: 'stopping', next: 'back' }; a._draw(); });
-  tryDraw(`${w}x${h} modrinth:loading`, () => { const a = makeApp(w, h); a.overlay = { type: 'modrinth', query: 'world', focus: 'query', loading: true, error: '', results: [], sel: 0, scroll: 0, installing: false, msg: '', versionFiltered: true }; a._draw(); });
-  tryDraw(`${w}x${h} modrinth:results`, () => {
+  const libs = require('../src/libraries').librariesFor('paper');
+  const libBase = { type: 'library', libs, libIdx: 0, query: 'world', focus: 'query', loading: false, error: '', results: [], sel: 0, scroll: 0, installing: false, msg: '', versionFiltered: true };
+  tryDraw(`${w}x${h} library:loading`, () => { const a = makeApp(w, h); a.overlay = { ...libBase, loading: true }; a._draw(); });
+  tryDraw(`${w}x${h} library:results`, () => {
     const a = makeApp(w, h);
-    a.overlay = { type: 'modrinth', query: 'world', focus: 'results', loading: false, error: '', sel: 1, scroll: 0, installing: false, msg: '', versionFiltered: true,
+    a.overlay = { ...libBase, focus: 'results', sel: 1,
       results: [
-        { slug: 'worldedit', title: 'WorldEdit', author: 'sk89q', downloads: 7818388, description: 'In-game map editor' },
-        { slug: 'essentialsx', title: 'EssentialsX', author: 'EssentialsX', downloads: 12500000, description: 'The essential commands plugin' },
+        { id: 'worldedit', title: 'WorldEdit', author: 'sk89q', downloads: 7818388, description: 'In-game map editor' },
+        { id: 'essentialsx', title: 'EssentialsX', author: 'EssentialsX', downloads: 12500000, description: 'The essential commands plugin' },
       ] };
     a._draw();
   });
-  tryDraw(`${w}x${h} modrinth:installing`, () => { const a = makeApp(w, h); a.overlay = { type: 'modrinth', query: '', focus: 'results', loading: false, error: '', results: [{ slug: 'x', title: 'X', downloads: 5, description: 'd' }], sel: 0, scroll: 0, installing: true, msg: 'Downloading X.jar…', versionFiltered: false }; a._draw(); });
+  tryDraw(`${w}x${h} library:installing`, () => { const a = makeApp(w, h); a.overlay = { ...libBase, libIdx: 1, focus: 'results', results: [{ id: 'x', title: 'X', downloads: 5, description: 'd' }], installing: true, msg: 'Downloading X.jar…', versionFiltered: false }; a._draw(); });
   // network view states
   for (const sel of [0, 1, 2, 3]) {
     tryDraw(`${w}x${h} network:sel${sel}`, () => {
@@ -126,6 +147,64 @@ for (const [w, h] of sizes) {
     a.files.viewer.editing = { idx: 1, buf: '  enabled: false' };
     a._draw();
   });
+
+  // Hostile console output (carriage returns, cursor-move escapes, OSC, bare
+  // ESC, tabs, long stack-trace lines) must never leave a control character in
+  // a cell or a non-SGR escape in a style — that's what corrupts real terminals.
+  tryDraw(`${w}x${h} dirty-console`, () => {
+    const a = makeApp(w, h);
+    const nasty = [
+      '[06:46:33 INFO]: \x1b[0;32;1mDone (8.458s)!\x1b[m For help, type "help"',
+      '[06:46:33 INFO]: at a.b.C.d(MinecraftServer.java:378) \x1b[0;30;22m~[paper-1.21.8.jar:?]\x1b[m',
+      'progress\rOVERWRITE\x1b[2K mid-line erase \x1b[10;5H cursor move',
+      '\x1b]0;title\x07 osc then text',
+      'tabs\there\tand\tthere',
+      'bare ESC \x1b alone and \x1b[?25l hide-cursor',
+    ];
+    for (const l of nasty) a.server.ingest(l);
+    a.view = 'console'; a._draw();
+    assertCleanBuffer(a, `${w}x${h} dirty-console`);
+  });
+
+  // Files view tooltip must not leak a literal SGR code (e.g. "[38;2;80;90;86m").
+  tryDraw(`${w}x${h} files-tooltip`, () => {
+    const a = makeApp(w, h); a.view = 'files'; a._draw();
+    assertNoLiteralSGR(a.screen, `${w}x${h} files-tooltip`);
+  });
+}
+
+// Launcher home/footer tooltips must not leak literal color codes either.
+tryDraw('launcher-home tooltip', () => {
+  const { launcher } = require('../src/launcher');
+  const sc = makeScreen(100, 30);
+  const input = new (require('events').EventEmitter)();
+  input.stop = () => {};
+  launcher(sc, input, { cfg: { servers: [{ name: 'S', dir: 'x', jar: 'j', type: 'paper', version: '1.21.8', ram: 2048 }] }, java: { ok: true } });
+  assertNoLiteralSGR(sc, 'launcher-home'); // first draw is synchronous
+  input.emit('key', { name: 'C-c' });      // resolve + detach the wizard
+});
+
+function assertCleanBuffer(a, label) {
+  for (let i = 0; i < a.screen.buf.length; i++) {
+    const cp = a.screen.buf[i].ch.codePointAt(0);
+    if (cp < 32 || cp === 127) { fail++; console.error('FAIL', label, 'control char in cell', i, 'cp=' + cp); return; }
+    const st = a.screen.buf[i].style;
+    if (st && /\x1b(?!\[[0-9;]*m)/.test(st)) { fail++; console.error('FAIL', label, 'non-SGR escape in style at', i); return; }
+  }
+}
+
+// Scan rendered rows for a literal SGR sequence body (what shows when an ESC was
+// baked into a string and then blanked) — e.g. "[38;2;80;90;86m" or "[0m".
+function assertNoLiteralSGR(scr, label) {
+  const w = scr.width;
+  for (let y = 0; y < scr.height; y++) {
+    let row = '';
+    for (let x = 0; x < w; x++) row += scr.buf[y * w + x].ch;
+    if (/\[\d{1,3}(;\d{1,3})*m/.test(row)) {
+      fail++; console.error('FAIL', label, 'literal SGR in row', y + ':', row.trim().slice(0, 70));
+      return;
+    }
+  }
 }
 
 console.log(`\nrender-test: ${count - fail}/${count} draws ok` + (fail ? `, ${fail} FAILED` : ' ✓'));
