@@ -495,7 +495,7 @@ class App {
       return this.draw();
     }
     this.overlay = {
-      type: 'library', libs, libIdx: 0, query: '', focus: 'query',
+      type: 'library', libs, libIdx: 0, query: '', searchedQuery: null, focus: 'query',
       loading: false, error: '', results: [], sel: 0, scroll: 0,
       installing: false, msg: '', versionFiltered: true,
     };
@@ -512,13 +512,25 @@ class App {
       o.libIdx = (o.libIdx + d + o.libs.length) % o.libs.length;
       return this.runLibrarySearch();
     }
-    if (k.name === 'up' || k.name === 'wheelup') { o.focus = 'results'; o.sel = Math.max(0, o.sel - 1); return this.draw(); }
-    if (k.name === 'down' || k.name === 'wheeldown') { o.focus = 'results'; o.sel = Math.min(o.results.length - 1, o.sel + 1); return this.draw(); }
+    // Moving down/up from the search field lands on the *top* result first
+    // (so the highlighted top result is reachable without scrolling past it).
+    if (k.name === 'up' || k.name === 'wheelup') {
+      if (o.focus !== 'results') o.focus = 'results';
+      else o.sel = Math.max(0, o.sel - 1);
+      return this.draw();
+    }
+    if (k.name === 'down' || k.name === 'wheeldown') {
+      if (o.focus !== 'results') o.focus = 'results';
+      else o.sel = Math.min(o.results.length - 1, o.sel + 1);
+      return this.draw();
+    }
     if (k.name === 'pageup') { o.focus = 'results'; o.sel = Math.max(0, o.sel - 8); return this.draw(); }
     if (k.name === 'pagedown') { o.focus = 'results'; o.sel = Math.min(o.results.length - 1, o.sel + 8); return this.draw(); }
     if (k.name === 'enter') {
       clearTimeout(o._searchTimer);
-      if (o.focus === 'results' && o.results[o.sel]) return this.installLibrary(o.results[o.sel]);
+      // If the shown results match the current query, Enter installs the
+      // highlighted one (the top result by default) — no scrolling required.
+      if (o.results[o.sel] && o.searchedQuery === o.query && !o.loading) return this.installLibrary(o.results[o.sel]);
       return this.runLibrarySearch();
     }
     // Typing searches live (debounced), so results update without pressing Enter.
@@ -540,13 +552,14 @@ class App {
     if (!o || o.type !== 'library') return;
     clearTimeout(o._searchTimer);
     const lib = o.libs[o.libIdx];
+    const q = o.query;
     o.loading = true; o.error = ''; o.msg = '';
     this.draw();
-    lib.search({ flavor: this.record.type, gameVersion: this.record.version, query: o.query })
+    lib.search({ flavor: this.record.type, gameVersion: this.record.version, query: q })
       .then((res) => {
         if (this.overlay !== o) return;
         o.loading = false; o.results = res.hits; o.versionFiltered = res.versionFiltered;
-        o.sel = 0; o.scroll = 0;
+        o.sel = 0; o.scroll = 0; o.searchedQuery = q; // results now reflect this query
         // Keep focus in the search field while typing; only no-results forces it.
         if (!res.hits.length) { o.focus = 'query'; o.msg = 'No results.'; }
         this.draw();
@@ -957,7 +970,7 @@ class App {
   drawPlayers(r) {
     const s = this.screen;
     const list = this.server.playerList();
-    const max = this.server.maxPlayers || this.record.maxPlayers || '?';
+    const max = this.maxPlayers();
     s.box(r.x, r.y, r.w, r.h, { style: C.borderHot, title: `Players ${list.length}/${max}`, titleStyle: C.title });
     if (this.pSel >= list.length) this.pSel = Math.max(0, list.length - 1);
     if (!list.length) {
@@ -965,14 +978,22 @@ class App {
       return;
     }
     const rows = r.h - 2;
+    // column headers
+    const pingX = r.x + r.w - 9;          // "Ping" column (right-aligned area)
+    const timeX = pingX - 9;              // online-time column
+    s.text(timeX, r.y, 'online', C.faint);
+    s.text(pingX, r.y, 'ping', C.faint);
     for (let i = 0; i < list.length && i < rows; i++) {
       const name = list[i];
       const sel = i === this.pSel;
-      if (sel) s.fillRect(r.x + 1, r.y + 1 + i, r.w - 2, 1, ' ', C.selBg);
+      const y = r.y + 1 + i;
+      if (sel) s.fillRect(r.x + 1, y, r.w - 2, 1, ' ', C.selBg);
       const info = this.server.players.get(name);
+      s.text(r.x + 2, y, (sel ? '▸ ' : '  ') + name, sel ? C.selFg + C.bold : C.text, timeX - r.x - 3);
       const t = info ? since(info.joinedAt) : '';
-      s.text(r.x + 2, r.y + 1 + i, (sel ? '▸ ' : '  ') + name, sel ? C.selFg + C.bold : C.text);
-      s.text(r.x + r.w - t.length - 2, r.y + 1 + i, t, sel ? C.selFg : C.muted);
+      s.text(timeX, y, t, sel ? C.selFg : C.muted);
+      const ping = info && info.ping != null ? info.ping + 'ms' : '—';
+      s.text(pingX, y, ping, sel ? C.selFg : pingColor(info && info.ping));
     }
     s.text(r.x + 2, r.y + r.h - 1, 'Enter: actions (op/kick/ban…)', C.faint, r.w - 4);
   }
@@ -1130,15 +1151,27 @@ class App {
     s.text(r.x + 2, r.y + r.h - 1, '↑↓ select · Enter run · Ctrl+R start/restart', C.faint, r.w - 4);
   }
 
-  // Cached so we don't re-read server.properties on every frame (the sidebar
-  // and Network view ask for it several times per draw).
-  serverPort() {
+  // Cached server.properties values so we don't re-read the file every frame
+  // (the sidebar / Players / Network views ask for them several times per draw).
+  serverProps() {
     const now = Date.now();
-    if (this._portCache && now - this._portCache.at < 2000) return this._portCache.val;
-    let val = 25565;
-    try { val = props.load(this.server.dir).model.values['server-port'] || 25565; } catch {}
-    this._portCache = { val, at: now };
+    if (this._propCache && now - this._propCache.at < 2000) return this._propCache.val;
+    let val = {};
+    try { val = props.load(this.server.dir).model.values || {}; } catch {}
+    this._propCache = { val, at: now };
     return val;
+  }
+  serverPort() { return this.serverProps()['server-port'] || 25565; }
+
+  // Prefer the live max from the server's `list` reply; fall back to the value
+  // configured in server.properties so it isn't a bare "?" before the server
+  // has reported in.
+  maxPlayers() {
+    if (this.server.maxPlayers) return this.server.maxPlayers;
+    if (this.record.maxPlayers) return this.record.maxPlayers;
+    const p = this.serverProps()['max-players'];
+    const n = parseInt(p, 10);
+    return Number.isFinite(n) ? n : '?';
   }
 
   // ---- network view ----
@@ -1304,8 +1337,7 @@ class App {
     kv('State', dot.label, dot.style);
     kv('Uptime', this.uptime(), C.white);
     if (this.server.category !== 'proxy') {
-      const max = this.server.maxPlayers || this.record.maxPlayers || '?';
-      kv('Players', `${this.server.playerList().length}/${max}`, C.green);
+      kv('Players', `${this.server.playerList().length}/${this.maxPlayers()}`, C.green);
     }
     gap();
     head('Performance');
@@ -1537,6 +1569,7 @@ function memColor(mb) { return !mb ? C.faint : mb < 1024 ? C.green : mb < 3072 ?
 function memColor2(pct) { return pct < 70 ? C.green : pct < 88 ? C.gold : C.red; }
 function cpuColor(p) { return p < 50 ? C.green : p < 85 ? C.gold : C.red; }
 function tpsColor(t, running) { return !running || t == null ? C.faint : t >= 19 ? C.green : t >= 15 ? C.gold : C.red; }
+function pingColor(p) { return p == null ? C.faint : p < 80 ? C.green : p < 200 ? C.gold : C.red; }
 function msptColor(m, running) { return !running || m == null ? C.faint : m <= 30 ? C.green : m <= 45 ? C.gold : C.red; }
 
 // Cheap sanity check that a downloaded file is really a jar (ZIP "PK" magic),

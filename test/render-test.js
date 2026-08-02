@@ -48,8 +48,8 @@ function makeApp(w, h) {
   server.status = STATUS.RUNNING;
   server.startedAt = Date.now() - 3725 * 1000;
   server.maxPlayers = 20;
-  server.players.set('Notch', { joinedAt: Date.now() - 600000 });
-  server.players.set('jeb_', { joinedAt: Date.now() - 60000 });
+  server.players.set('Notch', { joinedAt: Date.now() - 600000, ping: 42 });
+  server.players.set('jeb_', { joinedAt: Date.now() - 60000, ping: null });
   server.pushLine('[12:00:00] [Server thread/INFO]: Done (5.231s)! For help, type "help"', 'info');
   server.pushLine('[12:00:05] [Server thread/INFO]: Notch joined the game', 'info');
   server.pushLine('> say hello everyone', 'cmd');
@@ -197,6 +197,41 @@ driveLauncher('launcher-version search', [
   { name: 'down' }, { name: 'enter' },                 // pick a flavor -> version search box
   { name: 'char', ch: '1' }, { name: 'char', ch: '.' },// type a version filter
 ]);
+
+// TPS/MSPT parser must read every common format and never leak a reply line.
+tryDraw('tps/mspt parser', () => {
+  const cases = [
+    { kind: 'tps', line: '[12:00:00 INFO]: TPS from last 5s, 1m, 5m, 15m: 20.0, 19.8, 20.0, 20.0', tps: 19.8 },
+    { kind: 'tps', line: 'TPS from last 1m, 5m, 15m: *20.0, *20.0, *20.0', tps: 20 },
+    { kind: 'tps', line: 'Overall: Mean tick time: 6.40 ms. Mean TPS: 19.98', tps: 19.98 },
+  ];
+  for (const c of cases) {
+    const srv = new MinecraftServer({ name: 't', dir: '.', jar: 'x', type: 'paper', ram: 1024 });
+    srv.metrics = { tps: null, tps5: null, tps15: null, mspt: null };
+    srv._metricSentAt = Date.now(); srv._metricKind = c.kind;
+    const suppressed = srv.consumeMetric(c.line);
+    if (!suppressed) throw new Error('parser leaked: ' + c.line);
+    if (srv.metrics.tps !== c.tps) throw new Error(`parser tps ${srv.metrics.tps} !== ${c.tps} for: ${c.line}`);
+  }
+  // An unparseable but TPS-ish line within the window must still be swallowed.
+  const srv2 = new MinecraftServer({ name: 't', dir: '.', jar: 'x', type: 'paper', ram: 1024 });
+  srv2._metricSentAt = Date.now(); srv2._metricKind = 'tps';
+  if (!srv2.consumeMetric('TPS report: weird text no numbers')) throw new Error('unparseable TPS line leaked');
+});
+
+// A polled `list` reply must update the roster (and be suppressed); a ping
+// reply must attach to the right player.
+tryDraw('roster + ping parser', () => {
+  const srv = new MinecraftServer({ name: 't', dir: '.', jar: 'x', type: 'paper', ram: 1024, category: 'servers' });
+  srv._rosterSentAt = Date.now();
+  const consumed = srv.consumeMetric('[12:00:00 INFO]: There are 2 of a max of 20 players online: Alex, Steve');
+  if (!consumed) throw new Error('polled list reply leaked into console');
+  if (srv.playerList().join(',') !== 'Alex,Steve') throw new Error('roster not updated: ' + srv.playerList());
+  if (srv.maxPlayers !== 20) throw new Error('maxPlayers not parsed');
+  srv._pingSentAt = Date.now();
+  if (!srv.consumeMetric('Steve has a ping of 45ms')) throw new Error('ping reply leaked');
+  if (srv.players.get('Steve').ping !== 45) throw new Error('ping not attached: ' + srv.players.get('Steve').ping);
+});
 
 function assertCleanBuffer(a, label) {
   for (let i = 0; i < a.screen.buf.length; i++) {
