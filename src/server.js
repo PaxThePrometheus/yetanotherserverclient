@@ -67,7 +67,7 @@ class MinecraftServer extends EventEmitter {
     this.startedAt = 0;
     this.console = [];                // ring buffer of { text, level, t }
     this.maxConsole = 2000;
-    this.players = new Map();         // name -> { joinedAt }
+    this.players = new Map();         // name -> { joinedAt, ping }
     this.maxPlayers = record.maxPlayers || null;
     this._partial = '';               // incomplete stdout line
     this._stopTimer = null;
@@ -87,6 +87,14 @@ class MinecraftServer extends EventEmitter {
     this._mFlip = false;
     this._metricTimer = null;
     this._diskTimer = null;
+
+    // Roster + per-player ping are kept current by quietly polling `list` (and
+    // `ping <name>` where a plugin supports it) and swallowing the replies, so
+    // they stay accurate even when plugins rewrite join/leave messages.
+    this._rosterTimer = null;
+    this._rosterSentAt = 0;
+    this._pingSentAt = 0;
+    this.pingSupported = this.category !== 'proxy';
   }
 
   type() { return this.record.type; }
@@ -174,6 +182,7 @@ class MinecraftServer extends EventEmitter {
     if (!this.child) return;
     this._exitWanted = true;
     this.stopMetrics();
+    this.stopRoster();
     if (force) {
       this.pushLine('· force killing server…', 'sys');
       try { this.child.kill('SIGKILL'); } catch {}
@@ -205,6 +214,7 @@ class MinecraftServer extends EventEmitter {
   onExit(code, signal) {
     clearTimeout(this._stopTimer);
     this.stopMetrics();
+    this.stopRoster();
     this.stopDiskSampling();
     this.metrics.tps = this.metrics.tps5 = this.metrics.tps15 = this.metrics.mspt = null;
     const wasRunning = this.status === STATUS.RUNNING || this.status === STATUS.STARTING;
@@ -289,14 +299,16 @@ class MinecraftServer extends EventEmitter {
     if (this.status === STATUS.STARTING &&
         (/\bDone\b\s*\([\d.]+s\)!/.test(line) || /Listening on /i.test(line))) {
       this.setStatus(STATUS.RUNNING);
-      if (this.category !== 'proxy') this.sendRaw('list'); // seed the roster
       this.startMetrics();
+      this.startRoster();
       this.startDiskSampling();
       return;
     }
     let m;
+    // Instant join/leave (when the message isn't rewritten by a plugin); the
+    // periodic `list` poll reconciles everything else.
     if ((m = msg.match(/^([A-Za-z0-9_]{1,16}) joined the game/))) {
-      this.players.set(m[1], { joinedAt: Date.now() });
+      if (!this.players.has(m[1])) this.players.set(m[1], { joinedAt: Date.now(), ping: null });
       this.emit('players');
       return;
     }
@@ -305,14 +317,10 @@ class MinecraftServer extends EventEmitter {
       this.emit('players');
       return;
     }
-    // `list` reply: "There are 2 of a max of 20 players online: Alex, Steve"
-    if ((m = msg.match(/There are (\d+) of a max of (\d+) players online:?\s*(.*)$/))) {
+    // A manually-typed `list` reply (the polled one is consumed/suppressed).
+    if ((m = msg.match(/There are (\d+) of a max of (\d+) players online:?\s*(.*)$/i))) {
       this.maxPlayers = parseInt(m[2], 10);
-      const names = m[3].split(/,\s*/).map((s) => s.trim()).filter(Boolean);
-      const next = new Map();
-      for (const n of names) next.set(n, this.players.get(n) || { joinedAt: Date.now() });
-      this.players = next;
-      this.emit('players');
+      this.setRoster(m[3].split(/,\s*/).map((s) => s.trim()).filter(Boolean));
       return;
     }
   }
@@ -339,28 +347,132 @@ class MinecraftServer extends EventEmitter {
     this.sendRaw(cmd);
   }
 
+  // ---- roster + ping (quietly polled) ------------------------------------
+
+  startRoster() {
+    this.stopRoster();
+    if (this.category === 'proxy') return; // proxies use `glist`; skip for now
+    this._rosterTimer = setInterval(() => this.pollRoster(), 5000);
+    setTimeout(() => this.pollRoster(), 800);
+  }
+  stopRoster() { if (this._rosterTimer) { clearInterval(this._rosterTimer); this._rosterTimer = null; } }
+
+  pollRoster() {
+    if (this.status !== STATUS.RUNNING || !this.child) return;
+    this._rosterSentAt = Date.now();
+    this.sendRaw('list');
+  }
+
+  // Probe each online player's ping (best-effort: only works if a plugin adds a
+  // `ping <name>` command; self-disables if the server doesn't know it).
+  probePings() {
+    if (!this.pingSupported) return;
+    const names = [...this.players.keys()].slice(0, 20);
+    if (!names.length) return;
+    this._pingSentAt = Date.now();
+    for (const n of names) this.sendRaw('ping ' + n);
+  }
+
+  // Replace the roster with the names from a `list` reply, preserving known
+  // join time + ping for players who are still online.
+  setRoster(names) {
+    const next = new Map();
+    for (const n of names) next.set(n, this.players.get(n) || { joinedAt: Date.now(), ping: null });
+    this.players = next;
+    this.emit('players');
+  }
+
+  // Which suppressed poll did we fire most recently? (to attribute replies)
+  _latestPoll() {
+    const r = this._rosterSentAt, p = this._pingSentAt, m = this._metricSentAt;
+    if (r >= p && r >= m) return 'roster';
+    if (p >= m) return 'ping';
+    return 'metric';
+  }
+
   // Returns true if the line was a reply to our metric poll (and is suppressed).
+  // Tolerant of TPS/MSPT format differences across versions/forks; as a last
+  // resort it swallows any metric-looking line within the reply window so a
+  // format we don't parse still can't spam the console.
   consumeMetric(line) {
-    if (!this._metricSentAt || Date.now() - this._metricSentAt > 2500) return false;
-    const t = decolor(line);
+    const now = Date.now();
+    const win = (at) => at && now - at < 4000;
+    if (!win(this._metricSentAt) && !win(this._rosterSentAt) && !win(this._pingSentAt)) return false;
+    const t = decolor(line).trim();
     let m;
-    if ((m = t.match(/TPS from last[^:]*:\s*\*?\s*([\d.]+),\s*\*?\s*([\d.]+),\s*\*?\s*([\d.]+)/i))) {
-      this.metrics.tps = +m[1]; this.metrics.tps5 = +m[2]; this.metrics.tps15 = +m[3];
-      this.emit('metrics'); return true;
+
+    // --- roster: `list` reply -> "There are 2 of a max of 20 players online: a, b"
+    if (win(this._rosterSentAt) &&
+        (m = t.match(/There are (\d+)\s*(?:of a max of|\/)\s*(\d+)\s*players online:?\s*(.*)$/i))) {
+      this.maxPlayers = parseInt(m[2], 10);
+      this.setRoster(m[3].split(/,\s*/).map((s) => s.trim()).filter(Boolean));
+      this._rosterSentAt = 0;          // consume one reply (don't eat a manual `list`)
+      this.probePings();
+      return true;
     }
-    if ((m = t.match(/Mean TPS:\s*([\d.]+)/i))) { this.metrics.tps = +m[1]; this.emit('metrics'); return true; }
-    if (/Mean tick time:\s*([\d.]+)/i.test(t)) {
-      this.metrics.mspt = +RegExp.$1; this.emit('metrics'); return true;
+
+    // --- ping: a reply with a "<n>ms" figure (ping plugins vary in wording).
+    // Excludes tps/mspt lines (which also say "ms") so those still get parsed.
+    if (win(this._pingSentAt) && /\d\s*ms\b/i.test(t) && !/tps|tick|mspt/i.test(t)) {
+      const names = t.match(/\b([A-Za-z0-9_]{1,16})\b/g) || [];
+      const who = names.find((n) => this.players.has(n));
+      const ms = (t.match(/(\d+)\s*ms\b/i) || [])[1];
+      if (who && ms != null) {
+        const p = this.players.get(who);
+        if (p) { p.ping = parseInt(ms, 10); this.emit('players'); }
+      }
+      return true; // swallow the reply either way (no spam)
     }
-    if (/tick times|Server tick/i.test(t)) return true; // mspt header line
+
+    // Unknown command: attribute it to whichever poll fired most recently.
+    if (/Unknown(\s+or\s+incomplete)?\s+command/i.test(t)) {
+      const which = this._latestPoll();
+      if (which === 'ping') { this.pingSupported = false; }
+      else if (which === 'metric') { this.tpsSupported = false; this.stopMetrics(); }
+      return true; // roster `list` always exists, so never disable that
+    }
+
+    // Only roster/ping windows open (no metric reply expected) — let real
+    // console output (chat, etc.) through.
+    if (!win(this._metricSentAt)) return false;
+
+    // Forge: "Overall: Mean TPS: 19.98"
+    if ((m = t.match(/Mean TPS:?\s*([\d.]+)/i))) { this.setTps(+m[1]); return true; }
+
+    // Paper/Spigot/Purpur: "TPS from last 5s, 1m, 5m, 15m: 20.0, 20.0, 20.0, 20.0"
+    // (older builds drop the 5s column). Be liberal: any "TPS … : n, n[, …]".
+    if (/\bTPS\b/i.test(t) && !/tick/i.test(t) && t.includes(':')) {
+      const nums = (t.slice(t.lastIndexOf(':') + 1).match(/[\d.]+/g) || []).map(Number);
+      if (nums.length >= 1) {
+        // Prefer the 1-minute figure: index 1 when a 5s column is present.
+        const oneMin = nums.length >= 4 ? nums[1] : nums[0];
+        this.setTps(oneMin, nums);
+        return true;
+      }
+    }
+
+    // MSPT: "Mean tick time: 6.4 ms" (Forge) or Paper's two-line tick-times block.
+    if ((m = t.match(/Mean tick time:?\s*([\d.]+)/i))) { this.metrics.mspt = +m[1]; this.emit('metrics'); return true; }
+    if (/tick times?|Server tick/i.test(t)) return true; // mspt header line
     if (this._metricKind === 'mspt' && (m = t.match(/([\d.]+)\s*\/\s*[\d.]+\s*\/\s*[\d.]+/))) {
       this.metrics.mspt = +m[1]; this.emit('metrics'); return true;
     }
-    if (/Unknown(\s+or\s+incomplete)?\s+command/i.test(t)) {
-      // This flavor has no such command — stop polling so we don't loop.
-      this.tpsSupported = false; this.stopMetrics(); return true;
-    }
+
+    // Fallback: anything that smells like a tps/mspt reply gets swallowed so an
+    // unparsed format can't flood the console (we just won't have a number).
+    if (/\bTPS\b|\bMSPT\b|tick time|^[\s▴◼▸◴⌛*]*[\d.]+\s*\/\s*[\d.]+\s*\/\s*[\d.]+/i.test(t)) return true;
     return false;
+  }
+
+  // Store a TPS reading (and the spread when available). Clamps absurd values.
+  setTps(v, nums) {
+    if (!Number.isFinite(v)) return;
+    this.metrics.tps = Math.min(v, 1000);
+    if (nums && nums.length) {
+      this.metrics.tps5 = nums[nums.length >= 4 ? 2 : Math.min(1, nums.length - 1)] || null;
+      this.metrics.tps15 = nums[nums.length - 1] || null;
+    }
+    this.emit('metrics');
   }
 
   // World size on disk (best-effort, infrequent) + content (plugin/mod) count.
